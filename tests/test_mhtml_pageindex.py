@@ -28,6 +28,7 @@ from click.testing import CliRunner
 
 from openkb.mhtml import (
     MHTMLPrepareResult,
+    _rewrite_image_sources,
     html_to_markdown,
     prepare_mhtml_for_pageindex,
     unpack_mhtml,
@@ -640,6 +641,19 @@ class TestComplexImgSrcParsing:
         md = unpack_mhtml(mhtml, tmp_path / "out").markdown_path.read_text(encoding="utf-8")
         assert "./images/img001" in md
 
+    def test_src_with_gt_in_quoted_value_does_not_truncate(self):
+        html = '<img src="https://cdn.example.com/a>b.png" alt="x">'
+        rewritten = _rewrite_image_sources(
+            html,
+            {"https://cdn.example.com/a>b.png": "./images/img001.png"},
+        )
+        assert rewritten == '<img src="./images/img001.png" alt="x">'
+
+    def test_title_with_gt_does_not_truncate_tag(self):
+        html = '<img src="cid:i1" title="1 > 0" alt="A">'
+        rewritten = _rewrite_image_sources(html, {"i1": "./images/img001.png"})
+        assert rewritten == '<img src="./images/img001.png" title="1 > 0" alt="A">'
+
     def test_src_with_cjk_space_parens(self, tmp_path):
         url = "https://cdn.example.com/images/第 1 页 (测试).gif"
         html = f'<html><body><img src="{url}" alt="图片" title="阶段 1) 图片"></body></html>'
@@ -681,6 +695,12 @@ class TestComplexImgSrcParsing:
         assert 'data-idx="3"' in html_out
         assert 'alt="A"' in html_out
         assert 'src="./images/img001' in html_out
+
+    def test_boolean_and_unparsed_attrs_preserved_when_rewriting_src(self):
+        html = '<img  src = "cid:i1" data-x loading alt="A" weird title=\'T\'>'
+        rewritten = _rewrite_image_sources(html, {"i1": "./images/img001.png"})
+        expected = '<img  src = "./images/img001.png" data-x loading alt="A" weird title=\'T\'>'
+        assert rewritten == expected
 
 
 class TestMarkdownStructureFidelity:

@@ -497,70 +497,78 @@ def html_to_markdown(html: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Match an ``<img ...>`` tag (self-closing or open form), capturing the
-# attribute region between ``img`` and the closing ``>``. We don't parse
-# attributes with this regex — a quote-aware scanner walks the region so src
-# values containing spaces, CJK, parens, entities, and query/fragment strings
-# are extracted correctly. ``[^>]*?>`` stops at the first ``>`` that isn't
-# inside a quoted attribute value (the scanner handles the quoting; this just
-# bounds a single tag, and a stray ``>`` inside a quoted src is rare in real
-# archives — we re-scan the attr region for correctness).
-_IMG_TAG_RE = re.compile(r"<img\b([^>]*?)/?>", re.IGNORECASE | re.DOTALL)
+_IMG_START_RE = re.compile(r"<img\b", re.IGNORECASE)
 
-# A quoted attribute value: ``src="..."``, ``src='...'``, or ``src=value``
-# (unquoted, terminated by whitespace or ``>``). Captures the quote char (or
-# empty for unquoted) and the value.
-_ATTR_RE = re.compile(
-    r"""([^\s=]+)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))""",
-    re.DOTALL,
-)
+def _scan_img_tags(html: str):
+    """Yield complete ``<img ...>`` tags without stopping at quoted ``>``."""
+    for match in _IMG_START_RE.finditer(html):
+        quote: str | None = None
+        i = match.end()
+        while i < len(html):
+            ch = html[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+            elif ch in {'"', "'"}:
+                quote = ch
+            elif ch == ">":
+                end = i + 1
+                yield match.start(), end, html[match.start() : end]
+                break
+            i += 1
 
-
-def _parse_attrs(region: str) -> list[tuple[str, str, str]]:
-    r"""Parse an HTML tag's attribute region into ``(name, quote, value)`` tuples.
-
-    ``quote`` is ``'"'``, ``"'"``, or ``""`` (unquoted) so the original
-    spelling can be preserved when rewriting. Quoted values may contain
-    whitespace, ``>``, CJK, parens, and entities — only the matching quote
-    closes them. This is what the old ``[^"'>\s]+`` regex got wrong: it split
-    ``src="images/第 1 页 (测试).gif"`` on the space and stopped at ``>``.
-    """
-    attrs: list[tuple[str, str, str]] = []
-    for m in _ATTR_RE.finditer(region):
-        name = m.group(1)
-        if m.group(3) is not None:
-            attrs.append((name, '"', m.group(3)))
-        elif m.group(4) is not None:
-            attrs.append((name, "'", m.group(4)))
-        else:
-            attrs.append((name, "", m.group(5)))
-    return attrs
-
-
-def _rewrite_attr_src(
-    attrs: list[tuple[str, str, str]], ref_to_local: dict[str, str]
-) -> list[tuple[str, str, str]] | None:
-    """Return attrs with the first ``src`` resolved to a local path, or ``None``.
-
-    ``None`` means no rewrite (src missing or unknown) — the caller keeps the
-    original tag verbatim. Only the first ``src`` is touched; the value is
-    HTML-unescaped before lookup so ``&nbsp;``/``&amp;`` spellings resolve.
-    """
-    for i, (name, quote, value) in enumerate(attrs):
-        if name.lower() != "src":
+def _find_src_value_span(tag: str) -> tuple[int, int, str] | None:
+    """Return the ``src`` value span inside an ``<img>`` tag."""
+    i = 4  # after "<img"
+    limit = len(tag)
+    while i < limit:
+        while i < limit and tag[i].isspace():
+            i += 1
+        if i >= limit or tag[i] in ">/":
+            i += 1
             continue
-        resolved = _resolve_ref(_html_unescape(value), ref_to_local)
-        if resolved is None:
-            return None
-        attrs[i] = (name, quote, resolved)
-        return attrs
-    return None
 
+        name_start = i
+        while i < limit and not tag[i].isspace() and tag[i] not in "=>/":
+            i += 1
+        name = tag[name_start:i]
+        if not name:
+            i += 1
+            continue
+
+        while i < limit and tag[i].isspace():
+            i += 1
+        if i >= limit or tag[i] != "=":
+            continue
+
+        i += 1
+        while i < limit and tag[i].isspace():
+            i += 1
+        if i >= limit:
+            return None
+
+        quote = tag[i] if tag[i] in {'"', "'"} else None
+        if quote is not None:
+            value_start = i + 1
+            i = value_start
+            while i < limit and tag[i] != quote:
+                i += 1
+            value_end = i
+            if i < limit:
+                i += 1
+        else:
+            value_start = i
+            while i < limit and not tag[i].isspace() and tag[i] != ">":
+                i += 1
+            value_end = i
+
+        if name.lower() == "src":
+            return value_start, value_end, tag[value_start:value_end]
+    return None
 
 def _html_unescape(text: str) -> str:
     """Decode the common HTML entities that appear in ``<img src>`` values."""
     return _HTML_ENTITY_RE.sub(_replace_entity, text)
-
 
 _HTML_ENTITY_RE = re.compile(r"&(?:#(\d+)|#x([0-9a-fA-F]+)|(\w+));")
 _HTML_NAMED_ENTITIES = {
@@ -571,7 +579,6 @@ _HTML_NAMED_ENTITIES = {
     "apos": "'",
     "nbsp": " ",
 }
-
 
 def _replace_entity(m: re.Match[str]) -> str:
     if m.group(1) is not None:
@@ -588,33 +595,28 @@ def _replace_entity(m: re.Match[str]) -> str:
 
 
 def _rewrite_image_sources(html: str, ref_to_local: dict[str, str]) -> str:
-    r"""Rewrite ``<img src="cid:...">`` / ``<img src="url">`` to local paths.
-
-    Uses a quote-aware attribute scanner (not the old ``[^"'>\s]+`` regex) so
-    ``src`` values containing spaces, CJK, parens, HTML entities, and
-    query/fragment strings are parsed intact. Only the ``src`` value is
-    replaced; every other attribute is preserved byte-for-byte. Tags whose
-    ``src`` doesn't resolve to a known image part are left unchanged.
-    """
-
-    def repl(tag_match: re.Match[str]) -> str:
-        full = tag_match.group(0)
-        region = tag_match.group(1)
-        attrs = _parse_attrs(region)
-        rewritten = _rewrite_attr_src(attrs, ref_to_local)
-        if rewritten is None:
-            return full
-        # Rebuild the tag preserving original attribute order and quotes.
-        parts = ["<img"]
-        for name, quote, value in rewritten:
-            if quote:
-                parts.append(f" {name}={quote}{value}{quote}")
-            else:
-                parts.append(f" {name}={value}")
-        tail = "/" if full.rstrip().endswith("/>") else ""
-        return "".join(parts) + (tail + ">" if tail else ">")
-
-    return _IMG_TAG_RE.sub(repl, html)
+    """Rewrite resolvable ``<img src>`` values while preserving each tag."""
+    out: list[str] = []
+    cursor = 0
+    for start, end, tag in _scan_img_tags(html):
+        if start < cursor:
+            continue
+        span = _find_src_value_span(tag)
+        if span is None:
+            continue
+        value_start, value_end, value = span
+        resolved = _resolve_ref(_html_unescape(value), ref_to_local)
+        if resolved is None:
+            continue
+        out.append(html[cursor:start])
+        out.append(tag[:value_start])
+        out.append(resolved)
+        out.append(tag[value_end:])
+        cursor = end
+    if not out:
+        return html
+    out.append(html[cursor:])
+    return "".join(out)
 
 
 def _resolve_ref(src: str, ref_to_local: dict[str, str]) -> str | None:
