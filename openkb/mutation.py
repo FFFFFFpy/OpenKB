@@ -448,7 +448,10 @@ def publish_staged_tree(staging_dir: Path | None, kb_dir: Path) -> None:
     """Move staged raw/source artifacts into their final KB locations."""
     if staging_dir is None or not staging_dir.exists():
         return
-    for rel in ("raw", "wiki/sources"):
+    # ``.openkb/mhtml_assets`` is staged alongside raw/source for MHTML long
+    # docs (the PageIndex-ready Markdown + images). It relocates to the live
+    # KB on commit just like raw/source, keeping it inside the transaction.
+    for rel in ("raw", "wiki/sources", ".openkb/mhtml_assets"):
         src_root = staging_dir / rel
         if not src_root.exists():
             continue

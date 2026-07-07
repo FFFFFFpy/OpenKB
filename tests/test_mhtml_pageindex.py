@@ -604,6 +604,453 @@ class TestCliRemoveRecompileMhtml:
 
 
 # ---------------------------------------------------------------------------
+# Contract tests — WeKnora PR #1743 class of regressions
+# ---------------------------------------------------------------------------
+
+
+class TestComplexImgSrcParsing:
+    r"""The old ``[^"'>\s]+`` regex split on spaces and stopped at ``>`` inside
+    quoted src values — these are the inputs that broke it."""
+
+    def test_single_quoted_src(self, tmp_path):
+        html = "<html><body><img src='cid:test-image' alt='图片'></body></html>"
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(_build_mhtml(html=html, cid_images={"test-image": _PNG_BYTES}))
+        md = unpack_mhtml(mhtml, tmp_path / "out").markdown_path.read_text(encoding="utf-8")
+        assert "cid:test-image" not in md
+        assert "./images/img001" in md
+
+    def test_unquoted_src(self, tmp_path):
+        html = "<html><body><img src=https://cdn.example.com/a.png></body></html>"
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(
+            _build_mhtml(html=html, location_images={"https://cdn.example.com/a.png": _PNG_BYTES})
+        )
+        md = unpack_mhtml(mhtml, tmp_path / "out").markdown_path.read_text(encoding="utf-8")
+        assert "https://cdn.example.com/a.png" not in md
+        assert "./images/img001" in md
+
+    def test_content_location_query_fragment_html_omits(self, tmp_path):
+        # Part's Content-Location carries cache-busting query + fragment that
+        # the HTML src omits — normalized URL must still match.
+        loc = "https://cdn.example.com/imgs/photo.png?wx_fmt=png#imgIndex=0"
+        html = '<html><body><img src="https://cdn.example.com/imgs/photo.png"></body></html>'
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(_build_mhtml(html=html, location_images={loc: _PNG_BYTES}))
+        md = unpack_mhtml(mhtml, tmp_path / "out").markdown_path.read_text(encoding="utf-8")
+        assert "./images/img001" in md
+
+    def test_src_with_cjk_space_parens(self, tmp_path):
+        url = "https://cdn.example.com/images/第 1 页 (测试).gif"
+        html = f'<html><body><img src="{url}" alt="图片" title="阶段 1) 图片"></body></html>'
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(_build_mhtml(html=html, location_images={url: _PNG_BYTES}))
+        result = unpack_mhtml(mhtml, tmp_path / "out")
+        md = result.markdown_path.read_text(encoding="utf-8")
+        assert "https://cdn.example.com" not in md
+        assert "./images/img001.gif" in md
+        # title preserved (Task 3)
+        assert '![图片](./images/img001.gif "阶段 1) 图片")' in md
+
+    def test_unknown_src_left_unchanged(self, tmp_path):
+        html = '<html><body><img src="https://unknown.example/missing.png" alt="x"></body></html>'
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(_build_mhtml(html=html))  # no image parts attached
+        md = unpack_mhtml(mhtml, tmp_path / "out").markdown_path.read_text(encoding="utf-8")
+        # unresolved src preserved verbatim so the markdown is still valid
+        assert "https://unknown.example/missing.png" in md
+
+    def test_html_entity_in_src(self, tmp_path):
+        # src with &nbsp; entity; HTML-unescaped before lookup so it resolves.
+        loc = "https://cdn.example.com/path/a b.png"
+        html = '<html><body><img src="https://cdn.example.com/path/a&nbsp;b.png"></body></html>'
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(_build_mhtml(html=html, location_images={loc: _PNG_BYTES}))
+        md = unpack_mhtml(mhtml, tmp_path / "out").markdown_path.read_text(encoding="utf-8")
+        assert "./images/img001" in md
+
+    def test_other_attrs_preserved_when_rewriting_src(self, tmp_path):
+        html = (
+            '<html><body><img class="rich" src="cid:i1" '
+            'alt="A" data-idx="3" title="T"></body></html>'
+        )
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(_build_mhtml(html=html, cid_images={"i1": _PNG_BYTES}))
+        html_out = unpack_mhtml(mhtml, tmp_path / "out").html_path.read_text(encoding="utf-8")
+        assert 'class="rich"' in html_out
+        assert 'data-idx="3"' in html_out
+        assert 'alt="A"' in html_out
+        assert 'src="./images/img001' in html_out
+
+
+class TestMarkdownStructureFidelity:
+    """Block-boundary regressions (PR #1743 class): spacing after tables/images,
+    nested list indentation, blockquote boundaries, code-block blank lines, and
+    hard line breaks."""
+
+    def test_table_then_image_has_blank_line(self):
+        md = html_to_markdown(
+            "<table><tr><th>赛季制建立</th><th>BP、Rank</th></tr></table>"
+            '<img src="x.gif" alt="图片" title="阶段 1) 图片">'
+        )
+        assert "| 赛季制建立 | BP、Rank |" in md
+        assert '![图片](x.gif "阶段 1) 图片")' in md
+        # exactly one blank line between table and image
+        table_idx = md.index("| 赛季制建立")
+        img_idx = md.index("![图片]")
+        between = md[table_idx:img_idx]
+        assert "\n\n" in between
+
+    def test_image_then_paragraph_has_blank_line(self):
+        md = html_to_markdown(
+            '<img src="x.gif" alt="图片" title="阶段 1) 图片"><p>高机动性身法与独特枪械反馈</p>'
+        )
+        assert '![图片](x.gif "阶段 1) 图片")' in md
+        assert "高机动性身法与独特枪械反馈" in md
+        img_idx = md.index("![图片]")
+        para_idx = md.index("高机动性身法")
+        assert "\n\n" in md[img_idx:para_idx]
+
+    def test_nested_list_indentation(self):
+        md = html_to_markdown("<ul><li>parent<ul><li>child</li></ul></li></ul>")
+        assert "- parent\n  - child" in md
+
+    def test_blockquote_boundary(self):
+        md = html_to_markdown("<p>before</p><blockquote>quoted</blockquote><p>after</p>")
+        assert "before" in md
+        assert "> quoted" in md
+        assert "after" in md
+        # blank line boundaries on both sides of the quote
+        before_idx = md.index("before")
+        quote_idx = md.index("> quoted")
+        after_idx = md.index("after")
+        assert "\n\n" in md[before_idx:quote_idx]
+        assert "\n\n" in md[quote_idx:after_idx]
+
+    def test_fenced_code_preserves_internal_blank_lines(self):
+        md = html_to_markdown("<pre>line1\n\nline2</pre>")
+        assert "```\nline1\n\nline2\n```" in md
+
+    def test_hard_break_two_trailing_spaces(self):
+        md = html_to_markdown("<p>alpha<br>beta</p>")
+        assert "alpha  \nbeta" in md
+
+
+class TestImageTitlePreservation:
+    def test_title_becomes_markdown_title(self):
+        md = html_to_markdown('<img src="./images/img001.gif" alt="图片" title="阶段 1) 图片">')
+        assert '![图片](./images/img001.gif "阶段 1) 图片")' in md
+
+    def test_no_title_keeps_plain_form(self):
+        md = html_to_markdown('<img src="./images/img001.gif" alt="图片">')
+        assert "![图片](./images/img001.gif)" in md
+        assert '"' not in md
+
+    def test_quote_in_title_escaped(self):
+        md = html_to_markdown('<img src="x.png" alt="a" title=\'he said "hi"\'>')
+        assert '![a](x.png "he said \\"hi\\"")' in md
+
+
+class TestUnpackCleansStaleImages:
+    def test_retry_removes_old_images(self, tmp_path):
+        # First unpack: 2 images.
+        html = '<html><body><img src="cid:a"><img src="cid:b"></body></html>'
+        mhtml = tmp_path / "x.mhtml"
+        mhtml.write_bytes(_build_mhtml(html=html, cid_images={"a": _PNG_BYTES, "b": _PNG_BYTES}))
+        out = tmp_path / "out"
+        first = unpack_mhtml(mhtml, out)
+        assert sorted(p.name for p in first.image_dir.iterdir()) == ["img001.png", "img002.png"]
+
+        # Second unpack of a DIFFERENT archive (1 image) into the same out_dir:
+        # the stale img002.png from the first run must not survive.
+        html2 = '<html><body><img src="cid:a"></body></html>'
+        mhtml2 = tmp_path / "y.mhtml"
+        mhtml2.write_bytes(_build_mhtml(html=html2, cid_images={"a": _PNG_BYTES}))
+        second = unpack_mhtml(mhtml2, out)
+        assert sorted(p.name for p in second.image_dir.iterdir()) == ["img001.png"]
+
+
+class TestMhtmlStagingLifecycle:
+    """Task 1: MHTML assets enter the add mutation's transaction."""
+
+    def test_assets_staged_when_staging_dir_set(self, tmp_path):
+        # convert_document with a staging_dir writes mhtml_assets UNDER the
+        # staging tree, not the live KB.
+        kb_dir = _setup_kb(tmp_path)
+        staging = kb_dir / ".openkb" / "staging" / "add-test-abc123"
+        staging.mkdir(parents=True)
+        mhtml = tmp_path / "article.mhtml"
+        mhtml.write_bytes(_build_mhtml(html="<html><body><h1>Title</h1></body></html>"))
+        from openkb.converter import convert_document
+
+        result = convert_document(mhtml, kb_dir, staging_dir=staging)
+        # assets live under staging, not the live KB
+        assert result.pageindex_source is not None
+        assert ".openkb" in result.pageindex_source.parts
+        assert "staging" in result.pageindex_source.parts
+        assert not (kb_dir / ".openkb" / "mhtml_assets").exists()
+        # but staging holds them
+        assert (staging / ".openkb" / "mhtml_assets").exists()
+
+    def test_assets_in_live_kb_when_no_staging(self, tmp_path):
+        # convert_document without staging writes assets directly to the live KB.
+        kb_dir = _setup_kb(tmp_path)
+        mhtml = tmp_path / "article.mhtml"
+        mhtml.write_bytes(_build_mhtml(html="<html><body><h1>Title</h1></body></html>"))
+        from openkb.converter import convert_document
+
+        result = convert_document(mhtml, kb_dir, staging_dir=None)
+        assert result.pageindex_source is not None
+        live_assets = kb_dir / ".openkb" / "mhtml_assets" / result.doc_name
+        assert (live_assets / "document.md").exists()
+
+
+class TestMhtmlTransactionRollback:
+    """Task 7: a failed MHTML add must not leave live-KB residue — no registry
+    entry, no raw, no live mhtml_assets dir, no PageIndex blob."""
+
+    def test_compile_failure_rolls_back_live_mhtml_assets(self, tmp_path):
+        from openkb.cli import add_single_file
+        from openkb.indexer import IndexResult
+
+        kb_dir = _setup_kb(tmp_path)
+        new_id = "44444444-4444-4444-4444-444444444444"
+        files = kb_dir / ".openkb" / "files" / "default"
+        files.mkdir(parents=True)
+
+        def fake_index(md_path, kb_dir_arg, doc_name=None):
+            (files / f"{new_id}.md").write_bytes(b"blob")
+            return IndexResult(doc_id=new_id, description="", tree={"structure": []})
+
+        mhtml = tmp_path / "fail.mhtml"
+        mhtml.write_bytes(_build_mhtml(html="<html><body><h1>Fail</h1></body></html>"))
+
+        with (
+            patch("openkb.indexer.index_mhtml_document", side_effect=fake_index),
+            patch("openkb.agent.compiler.compile_long_doc", side_effect=RuntimeError("boom")),
+            patch("openkb.cli.time.sleep"),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            outcome = add_single_file(mhtml, kb_dir)
+
+        assert outcome == "failed"
+        # live KB residue must be gone
+        assert not (kb_dir / "raw" / "fail.mhtml").exists()
+        assert not (kb_dir / ".openkb" / "mhtml_assets").exists() or not any(
+            (kb_dir / ".openkb" / "mhtml_assets").iterdir()
+        )
+        assert not (files / f"{new_id}.md").exists()  # blob rolled back
+        # registry empty
+        from openkb.state import HashRegistry
+
+        assert HashRegistry(kb_dir / ".openkb" / "hashes.json").all_entries() == {}
+
+
+class TestPageWindowFailureRaises:
+    """Task 5: a page-window read failure must raise and roll back, not
+    silently truncate."""
+
+    def _fake_client(self, doc_id, structure):
+        col = MagicMock()
+        col.add.return_value = doc_id
+        col.get_document.return_value = {
+            "doc_name": "d",
+            "doc_description": "",
+            "structure": structure,
+        }
+        client = MagicMock()
+        client.collection.return_value = col
+        return col, client
+
+    def test_first_window_failure_raises_and_cleans(self, kb_dir, tmp_path, monkeypatch):
+        monkeypatch.delenv("PAGEINDEX_API_KEY", raising=False)
+        from openkb.indexer import index_mhtml_document
+
+        md_path = kb_dir / ".openkb" / "mhtml_assets" / "d" / "document.md"
+        md_path.parent.mkdir(parents=True)
+        md_path.write_text("# d\n", encoding="utf-8")
+
+        structure = [{"title": "A", "start_index": 1, "end_index": 2000, "nodes": []}]
+        col, client = self._fake_client("doc-fail1", structure)
+        col.get_page_content.side_effect = RuntimeError("backend down")
+
+        with patch("openkb.indexer.PageIndexClient", return_value=client):
+            with pytest.raises(RuntimeError, match="page read failed"):
+                index_mhtml_document(md_path, kb_dir, doc_name="d")
+
+        # rolled back: PageIndex doc deleted, no artifacts written
+        col.delete_document.assert_called_once_with("doc-fail1")
+        assert not (kb_dir / "wiki" / "summaries" / "d.md").exists()
+        assert not (kb_dir / "wiki" / "sources" / "d.json").exists()
+
+    def test_second_window_failure_raises_and_cleans(self, kb_dir, tmp_path, monkeypatch):
+        monkeypatch.delenv("PAGEINDEX_API_KEY", raising=False)
+        from openkb.indexer import index_mhtml_document
+
+        md_path = kb_dir / ".openkb" / "mhtml_assets" / "d" / "document.md"
+        md_path.parent.mkdir(parents=True)
+        md_path.write_text("# d\n", encoding="utf-8")
+
+        # max_index > 1000 → forces 2 windows; first succeeds, second fails.
+        structure = [{"title": "A", "start_index": 1, "end_index": 1500, "nodes": []}]
+        col, client = self._fake_client("doc-fail2", structure)
+
+        calls = {"n": 0}
+
+        def fake_get_page_content(doc_id, rng):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [{"page": 1, "content": "page one"}]
+            raise RuntimeError("backend down mid-doc")
+
+        col.get_page_content.side_effect = fake_get_page_content
+
+        with patch("openkb.indexer.PageIndexClient", return_value=client):
+            with pytest.raises(RuntimeError, match="page read failed"):
+                index_mhtml_document(md_path, kb_dir, doc_name="d")
+
+        # the partial first window must NOT have been written as artifacts
+        col.delete_document.assert_called_once_with("doc-fail2")
+        assert not (kb_dir / "wiki" / "summaries" / "d.md").exists()
+        assert not (kb_dir / "wiki" / "sources" / "d.json").exists()
+        # first window was read, second failed (and retried)
+        assert calls["n"] >= 2
+
+    def test_all_windows_succeed_writes_all_pages(self, kb_dir, tmp_path, monkeypatch):
+        monkeypatch.delenv("PAGEINDEX_API_KEY", raising=False)
+        from openkb.indexer import index_mhtml_document
+
+        md_path = kb_dir / ".openkb" / "mhtml_assets" / "d" / "document.md"
+        md_path.parent.mkdir(parents=True)
+        md_path.write_text("# d\n", encoding="utf-8")
+
+        structure = [{"title": "A", "start_index": 1, "end_index": 1500, "nodes": []}]
+        col, client = self._fake_client("doc-ok", structure)
+
+        # The tree has nodes at lines 1 and 1500 (the structure's bounds).
+        def fake_get_page_content(doc_id, rng):
+            start, end = (int(x) for x in rng.split("-"))
+            existing = {1, 1500}
+            return [{"page": p, "content": f"p{p}"} for p in existing if start <= p <= end]
+
+        col.get_page_content.side_effect = fake_get_page_content
+
+        with patch("openkb.indexer.PageIndexClient", return_value=client):
+            result = index_mhtml_document(md_path, kb_dir, doc_name="d")
+
+        assert result.doc_id == "doc-ok"
+        json_file = kb_dir / "wiki" / "sources" / "d.json"
+        assert json_file.exists()
+        data = json.loads(json_file.read_text(encoding="utf-8"))
+        # both windows' pages present
+        assert {p["page"] for p in data} == {1, 1500}
+
+
+class TestRemoveCleansMhtmlAssets:
+    """Task 6: remove cleans .openkb/mhtml_assets/<doc_name>/."""
+
+    def test_remove_deletes_mhtml_assets_dir(self, tmp_path):
+        from openkb.cli import cli
+        from openkb.state import HashRegistry
+
+        kb_dir = _setup_kb(tmp_path)
+        doc_name = "article"
+        # seed registry + summary + the mhtml_assets dir
+        (kb_dir / "wiki" / "summaries").mkdir(parents=True, exist_ok=True)
+        (kb_dir / "wiki" / "summaries" / f"{doc_name}.md").write_text(
+            "---\ntype: Summary\n---\n# A\n", encoding="utf-8"
+        )
+        assets = kb_dir / ".openkb" / "mhtml_assets" / doc_name
+        assets.mkdir(parents=True)
+        (assets / "document.md").write_text("# A\n", encoding="utf-8")
+        (assets / "images").mkdir()
+        (assets / "images" / "img001.png").write_bytes(b"img")
+        (kb_dir / "raw").mkdir(exist_ok=True)
+        (kb_dir / "raw" / "article.mhtml").write_bytes(b"mhtml")
+        reg = HashRegistry(kb_dir / ".openkb" / "hashes.json")
+        reg.add(
+            "h1",
+            {
+                "name": "article.mhtml",
+                "doc_name": doc_name,
+                "type": "mhtml",
+                "doc_id": "mhtml-1",
+                "raw_path": "raw/article.mhtml",
+            },
+        )
+
+        runner = CliRunner()
+        with (
+            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
+            patch("openkb.cli._cleanup_pageindex", return_value=(True, "deleted")),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            result = runner.invoke(cli, ["remove", "article.mhtml", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert not assets.exists()  # mhtml_assets cleaned
+        assert "mhtml_assets" in result.output  # shown in the plan
+
+    def test_remove_dry_run_lists_mhtml_assets(self, tmp_path):
+        from openkb.cli import cli
+        from openkb.state import HashRegistry
+
+        kb_dir = _setup_kb(tmp_path)
+        doc_name = "article"
+        (kb_dir / "wiki" / "summaries").mkdir(parents=True, exist_ok=True)
+        (kb_dir / "wiki" / "summaries" / f"{doc_name}.md").write_text(
+            "---\ntype: Summary\n---\n# A\n", encoding="utf-8"
+        )
+        assets = kb_dir / ".openkb" / "mhtml_assets" / doc_name
+        assets.mkdir(parents=True)
+        (assets / "document.md").write_text("# A\n", encoding="utf-8")
+        reg = HashRegistry(kb_dir / ".openkb" / "hashes.json")
+        reg.add(
+            "h1",
+            {"name": "article.mhtml", "doc_name": doc_name, "type": "mhtml", "doc_id": "m1"},
+        )
+
+        runner = CliRunner()
+        with (
+            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            result = runner.invoke(cli, ["remove", "article.mhtml", "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        assert "mhtml_assets" in result.output
+        # dry-run leaves assets on disk
+        assert assets.exists()
+
+    def test_remove_missing_mhtml_assets_no_error(self, tmp_path):
+        from openkb.cli import cli
+        from openkb.state import HashRegistry
+
+        kb_dir = _setup_kb(tmp_path)
+        doc_name = "article"
+        (kb_dir / "wiki" / "summaries").mkdir(parents=True, exist_ok=True)
+        (kb_dir / "wiki" / "summaries" / f"{doc_name}.md").write_text(
+            "---\ntype: Summary\n---\n# A\n", encoding="utf-8"
+        )
+        reg = HashRegistry(kb_dir / ".openkb" / "hashes.json")
+        reg.add(
+            "h1",
+            {"name": "article.mhtml", "doc_name": doc_name, "type": "mhtml", "doc_id": "m1"},
+        )
+        # NOTE: no mhtml_assets dir exists
+
+        runner = CliRunner()
+        with (
+            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
+            patch("openkb.cli._cleanup_pageindex", return_value=(True, "deleted")),
+            patch("openkb.cli._setup_llm_key"),
+        ):
+            result = runner.invoke(cli, ["remove", "article.mhtml", "--yes"])
+
+        assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
 # Type-set unit tests (mirrors test_recompile's cloud coverage)
 # ---------------------------------------------------------------------------
 

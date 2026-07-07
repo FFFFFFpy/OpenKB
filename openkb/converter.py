@@ -213,9 +213,16 @@ def convert_document(
             # .openkb/mhtml_assets/<doc_name>/. Never reaches the short-doc /
             # MarkItDown branch below. The prepared Markdown is a PageIndex-
             # managed input (not a wiki source), carried on pageindex_source.
+            # When staging, write the assets under the staging tree so they
+            # relocate into the live KB on publish and roll back on failure.
             from openkb.mhtml import prepare_mhtml_for_pageindex
 
-            prepared = prepare_mhtml_for_pageindex(raw_dest, kb_dir, doc_name=doc_name)
+            prepared = prepare_mhtml_for_pageindex(
+                raw_dest,
+                kb_dir,
+                doc_name=doc_name,
+                artifact_root=staging_dir,
+            )
             logger.info("MHTML prepared for PageIndex: %s", prepared.markdown_path)
             return ConvertResult(
                 raw_path=raw_dest,

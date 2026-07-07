@@ -399,6 +399,22 @@ def _final_artifact_paths(result, kb_dir: Path) -> tuple[Path | None, Path | Non
     return final_raw, final_source
 
 
+def _final_pageindex_source(result, kb_dir: Path) -> Path | None:
+    """Final live-KB path of a staged PageIndex input (MHTML's document.md).
+
+    Staged assets live under ``staging/.openkb/mhtml_assets/<doc_name>/`` and
+    are relocated to ``kb/.openkb/mhtml_assets/<doc_name>/`` on publish, so the
+    staged ``pageindex_source`` path's leaf segments (the doc_name dir +
+    ``document.md``) carry over unchanged — only the root changes.
+    """
+    if result.pageindex_source is None:
+        return None
+    rel = result.pageindex_source.relative_to(
+        result.pageindex_source.parents[1]  # .../<doc_name>/document.md → root
+    )
+    return kb_dir / ".openkb" / "mhtml_assets" / rel
+
+
 def _snapshot_add_paths(
     kb_dir: Path,
     doc_name: str,
@@ -417,6 +433,9 @@ def _snapshot_add_paths(
         kb_dir / ".openkb" / "pageindex.db-wal",
         kb_dir / ".openkb" / "pageindex.db-shm",
         kb_dir / ".openkb" / "pageindex.db-journal",
+        # MHTML PageIndex inputs land here on publish; record the dir so a
+        # post-publish index/compile failure rolls it back out of the live KB.
+        kb_dir / ".openkb" / "mhtml_assets" / doc_name,
         kb_dir / "wiki" / "summaries" / f"{doc_name}.md",
         kb_dir / "wiki" / "sources" / f"{doc_name}.json",
         kb_dir / "wiki" / "sources" / "images" / doc_name,
@@ -512,6 +531,12 @@ def _add_single_file_locked(
             result.raw_path = final_raw
         if final_source is not None:
             result.source_path = final_source
+        # Staged PageIndex inputs (MHTML's document.md) relocate on publish;
+        # re-point the result at the live-KB path so indexing reads the
+        # committed artifact, not the (about-to-be-cleaned) staging copy.
+        final_pi_source = _final_pageindex_source(result, kb_dir)
+        if final_pi_source is not None:
+            result.pageindex_source = final_pi_source
 
         if result.is_long_doc:
             if result.raw_path is None:
@@ -1331,6 +1356,19 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
             )
         )
 
+    # MHTML web archives stage their PageIndex-ready Markdown + images under
+    # .openkb/mhtml_assets/<doc_name>/. Removed regardless of --keep-raw (that
+    # flag only preserves the original raw copy), and independent of
+    # --keep-empty (concept/entity semantics). Missing dir is a no-op.
+    mhtml_assets_dir = openkb_dir / "mhtml_assets" / doc_name
+    if doc_type in {"mhtml", "mht"} and mhtml_assets_dir.is_dir():
+        actions.append(
+            (
+                "DELETE",
+                f"{mhtml_assets_dir.relative_to(kb_dir)}/  (MHTML PageIndex assets)",
+            )
+        )
+
     # Scan concept pages to predict which will be edited vs. deleted.
     # Only frontmatter ``sources:`` membership drives the plan — body-only
     # references (e.g. a stray ``See also:`` line a user added by hand
@@ -1447,6 +1485,8 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
     source_json.unlink(missing_ok=True)
     if images_dir.is_dir():
         shutil.rmtree(images_dir, ignore_errors=True)
+    if doc_type in {"mhtml", "mht"} and mhtml_assets_dir.is_dir():
+        shutil.rmtree(mhtml_assets_dir, ignore_errors=True)
 
     concept_result = remove_doc_from_concept_pages(
         wiki_dir,

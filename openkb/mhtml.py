@@ -16,6 +16,7 @@ import email.policy
 import logging
 import mimetypes
 import re
+import shutil
 import unicodedata
 from dataclasses import dataclass
 from email.message import Message
@@ -66,6 +67,24 @@ def _ext_for_content_type(content_type: str) -> str:
         return ".bin"
     ext = mimetypes.guess_extension(content_type.split(";", 1)[0].strip().lower())
     return ext or ".bin"
+
+
+def _ext_for_image(part: Message) -> str:
+    """Return the dotted extension for an image MIME part.
+
+    Prefers the extension from the part's ``Content-Location`` URL (which
+    reflects the original filename, e.g. ``.gif``), falling back to the
+    extension implied by ``Content-Type``. The Content-Type alone is wrong
+    when a part carries e.g. PNG bytes under a ``.gif`` URL — the on-disk
+    filename should match how the HTML references it.
+    """
+    loc = part.get("Content-Location")
+    if loc:
+        path = _normalize_url(loc)
+        ext = Path(path).suffix
+        if ext:
+            return ext.lower()
+    return _ext_for_content_type(part.get_content_type())
 
 
 def _iter_parts(msg: Message):
@@ -236,14 +255,21 @@ class _HtmlToMarkdown(HTMLParser):
         elif t in self._BLOCK_TAGS:
             self._blank()
         elif t == "br":
-            self._out.append("\n")
+            # Markdown hard line break: two trailing spaces + newline.
+            self._out.append("  \n")
         elif t == "hr":
             self._blank()
             self._out.append("---\n")
         elif t == "ul":
+            # A nested list opens inside a <li> whose marker is still on the
+            # current line; start the child on its own line before indenting.
+            if self._list_stack:
+                self._out.append("\n")
             self._list_stack.append("ul")
             self._list_counters.append(0)
         elif t == "ol":
+            if self._list_stack:
+                self._out.append("\n")
             self._list_stack.append("ol")
             self._list_counters.append(0)
         elif t == "li":
@@ -254,6 +280,7 @@ class _HtmlToMarkdown(HTMLParser):
             else:
                 self._out.append(f"{indent}- ")
         elif t == "blockquote":
+            self._blank()
             self._out.append("> ")
         elif t == "pre":
             self._blank()
@@ -296,10 +323,14 @@ class _HtmlToMarkdown(HTMLParser):
             if self._list_stack:
                 self._list_stack.pop()
                 self._list_counters.pop()
-            self._blank()
-        elif t == "blockquote":
             self._out.append("\n")
+        elif t == "blockquote":
+            self._out.append("\n\n")
         elif t == "pre":
+            # Ensure the closing fence sits on its own line even if the pre
+            # content didn't end with a newline.
+            if self._out and not self._out[-1].endswith("\n"):
+                self._out.append("\n")
             self._out.append("```\n\n")
             self._pre_depth = max(0, self._pre_depth - 1)
         elif t == "code" and not self._pre_depth:
@@ -372,7 +403,14 @@ class _HtmlToMarkdown(HTMLParser):
         alt = (attrs.get("alt") or "").strip()
         if not src:
             return
-        self._out.append(f"\n![{alt}]({src})\n")
+        title = (attrs.get("title") or "").strip()
+        if title:
+            # Escape double quotes (the Markdown title delimiter) and collapse
+            # newlines so the image stays on one line.
+            safe_title = title.replace('"', '\\"').replace("\n", " ").replace("\r", " ")
+            self._out.append(f'\n![{alt}]({src} "{safe_title}")\n')
+        else:
+            self._out.append(f"\n![{alt}]({src})\n")
 
     def _emit_table(self) -> None:
         rows = self._table_rows
@@ -394,9 +432,28 @@ class _HtmlToMarkdown(HTMLParser):
 
     def markdown(self) -> str:
         text = "".join(self._out)
-        # collapse 3+ blank lines to 2
-        text = re.sub(r"\n{3,}", "\n\n", text)
+        # Collapse 3+ blank lines to 2 OUTSIDE fenced code blocks only. Inside a
+        # ``` block, blank lines are content (the very thing PR #1743 lost to a
+        # blanket .strip/collapse) — protect them by splitting on the fences.
+        text = _collapse_blank_lines_outside_code(text)
         return text.strip() + "\n"
+
+
+def _collapse_blank_lines_outside_code(text: str) -> str:
+    """Collapse 3+ blank lines to 2 in prose, leaving fenced code verbatim.
+
+    Splits on `` ``` `` fences; even-indexed segments are prose (collapsed),
+    odd-indexed segments are code (untouched). An unclosed fence leaves the
+    tail verbatim, which is the safe choice for malformed input.
+    """
+    parts = text.split("```")
+    out: list[str] = []
+    for i, segment in enumerate(parts):
+        if i % 2 == 1:  # inside a fenced code block — verbatim
+            out.append(segment)
+        else:
+            out.append(re.sub(r"\n{3,}", "\n\n", segment))
+    return "```".join(out)
 
 
 # A line that is *exactly* ``**NN Title**`` (or ``**N.M Title**``): the whole
@@ -440,56 +497,156 @@ def html_to_markdown(html: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-_IMG_SRC_RE = re.compile(
-    r"""<img\b[^>]*\bsrc\s*=\s*["']?([^"'>\s]+)["']?[^>]*>""",
-    re.IGNORECASE | re.DOTALL,
+# Match an ``<img ...>`` tag (self-closing or open form), capturing the
+# attribute region between ``img`` and the closing ``>``. We don't parse
+# attributes with this regex — a quote-aware scanner walks the region so src
+# values containing spaces, CJK, parens, entities, and query/fragment strings
+# are extracted correctly. ``[^>]*?>`` stops at the first ``>`` that isn't
+# inside a quoted attribute value (the scanner handles the quoting; this just
+# bounds a single tag, and a stray ``>`` inside a quoted src is rare in real
+# archives — we re-scan the attr region for correctness).
+_IMG_TAG_RE = re.compile(r"<img\b([^>]*?)/?>", re.IGNORECASE | re.DOTALL)
+
+# A quoted attribute value: ``src="..."``, ``src='...'``, or ``src=value``
+# (unquoted, terminated by whitespace or ``>``). Captures the quote char (or
+# empty for unquoted) and the value.
+_ATTR_RE = re.compile(
+    r"""([^\s=]+)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))""",
+    re.DOTALL,
 )
 
 
-def _rewrite_image_sources(html: str, ref_to_local: dict[str, str]) -> str:
-    """Rewrite ``<img src="cid:...">`` / ``<img src="url|basename">`` to local paths.
+def _parse_attrs(region: str) -> list[tuple[str, str, str]]:
+    r"""Parse an HTML tag's attribute region into ``(name, quote, value)`` tuples.
 
-    ``ref_to_local`` is keyed by both Content-ID (``image001``) and the
-    Content-Location basename/full URL, so cid: refs and URL refs both resolve.
-    Unknown sources are left untouched (PageIndex will still accept the md).
+    ``quote`` is ``'"'``, ``"'"``, or ``""`` (unquoted) so the original
+    spelling can be preserved when rewriting. Quoted values may contain
+    whitespace, ``>``, CJK, parens, and entities — only the matching quote
+    closes them. This is what the old ``[^"'>\s]+`` regex got wrong: it split
+    ``src="images/第 1 页 (测试).gif"`` on the space and stopped at ``>``.
+    """
+    attrs: list[tuple[str, str, str]] = []
+    for m in _ATTR_RE.finditer(region):
+        name = m.group(1)
+        if m.group(3) is not None:
+            attrs.append((name, '"', m.group(3)))
+        elif m.group(4) is not None:
+            attrs.append((name, "'", m.group(4)))
+        else:
+            attrs.append((name, "", m.group(5)))
+    return attrs
+
+
+def _rewrite_attr_src(
+    attrs: list[tuple[str, str, str]], ref_to_local: dict[str, str]
+) -> list[tuple[str, str, str]] | None:
+    """Return attrs with the first ``src`` resolved to a local path, or ``None``.
+
+    ``None`` means no rewrite (src missing or unknown) — the caller keeps the
+    original tag verbatim. Only the first ``src`` is touched; the value is
+    HTML-unescaped before lookup so ``&nbsp;``/``&amp;`` spellings resolve.
+    """
+    for i, (name, quote, value) in enumerate(attrs):
+        if name.lower() != "src":
+            continue
+        resolved = _resolve_ref(_html_unescape(value), ref_to_local)
+        if resolved is None:
+            return None
+        attrs[i] = (name, quote, resolved)
+        return attrs
+    return None
+
+
+def _html_unescape(text: str) -> str:
+    """Decode the common HTML entities that appear in ``<img src>`` values."""
+    return _HTML_ENTITY_RE.sub(_replace_entity, text)
+
+
+_HTML_ENTITY_RE = re.compile(r"&(?:#(\d+)|#x([0-9a-fA-F]+)|(\w+));")
+_HTML_NAMED_ENTITIES = {
+    "amp": "&",
+    "lt": "<",
+    "gt": ">",
+    "quot": '"',
+    "apos": "'",
+    "nbsp": " ",
+}
+
+
+def _replace_entity(m: re.Match[str]) -> str:
+    if m.group(1) is not None:
+        try:
+            return chr(int(m.group(1)))
+        except (ValueError, OverflowError):
+            return m.group(0)
+    if m.group(2) is not None:
+        try:
+            return chr(int(m.group(2), 16))
+        except (ValueError, OverflowError):
+            return m.group(0)
+    return _HTML_NAMED_ENTITIES.get(m.group(3), m.group(0))
+
+
+def _rewrite_image_sources(html: str, ref_to_local: dict[str, str]) -> str:
+    r"""Rewrite ``<img src="cid:...">`` / ``<img src="url">`` to local paths.
+
+    Uses a quote-aware attribute scanner (not the old ``[^"'>\s]+`` regex) so
+    ``src`` values containing spaces, CJK, parens, HTML entities, and
+    query/fragment strings are parsed intact. Only the ``src`` value is
+    replaced; every other attribute is preserved byte-for-byte. Tags whose
+    ``src`` doesn't resolve to a known image part are left unchanged.
     """
 
-    def repl(match: re.Match[str]) -> str:
-        tag = match.group(0)
-        src = match.group(1).strip()
-        local = _resolve_ref(src, ref_to_local)
-        if local is None:
-            return tag
-        return re.sub(
-            r"""(\bsrc\s*=\s*["']?)([^"'>\s]+)(["']?)""",
-            lambda m: f"{m.group(1)}{local}{m.group(3)}",
-            tag,
-            count=1,
-            flags=re.IGNORECASE,
-        )
+    def repl(tag_match: re.Match[str]) -> str:
+        full = tag_match.group(0)
+        region = tag_match.group(1)
+        attrs = _parse_attrs(region)
+        rewritten = _rewrite_attr_src(attrs, ref_to_local)
+        if rewritten is None:
+            return full
+        # Rebuild the tag preserving original attribute order and quotes.
+        parts = ["<img"]
+        for name, quote, value in rewritten:
+            if quote:
+                parts.append(f" {name}={quote}{value}{quote}")
+            else:
+                parts.append(f" {name}={value}")
+        tail = "/" if full.rstrip().endswith("/>") else ""
+        return "".join(parts) + (tail + ">" if tail else ">")
 
-    return _IMG_SRC_RE.sub(repl, html)
+    return _IMG_TAG_RE.sub(repl, html)
 
 
 def _resolve_ref(src: str, ref_to_local: dict[str, str]) -> str | None:
     """Map an ``<img src>`` value to its local image path, if known.
 
-    Tries, in order: the CID (for ``cid:`` refs), the raw src, the decoded src,
-    the normalized URL (query/fragment stripped — this is what actually matches
-    browser-saved Content-Location values), and finally the URL basename as a
-    last resort.
+    Tries, in order: the CID (for ``cid:`` refs), the raw src, the HTML-unescaped
+    src (``&amp;``→``&``), the URL-decoded src, the normalized URL (query/fragment
+    stripped — this is what actually matches browser-saved Content-Location values),
+    and finally the URL basename as a last resort. The basename is a FALLBACK
+    only: it collides across CDN-served images, so it never overrides a more
+    specific full/normalized URL match recorded first.
     """
     if src.lower().startswith("cid:"):
         cid = _strip_cid(src[4:])
         return ref_to_local.get(cid)
     if src in ref_to_local:
         return ref_to_local[src]
-    decoded = unquote(src)
+    unescaped = _html_unescape(src)
+    if unescaped != src and unescaped in ref_to_local:
+        return ref_to_local[unescaped]
+    decoded = unquote(unescaped)
     if decoded in ref_to_local:
         return ref_to_local[decoded]
-    normalized = _normalize_url(src)
+    normalized = _normalize_url(unescaped)
     if normalized in ref_to_local:
         return ref_to_local[normalized]
+    # ``&nbsp;`` decodes to U+00A0; HTML/Content-Location usually spell it as a
+    # regular space. Collapse all whitespace to a single space before comparing
+    # once more, against both the raw and normalized ref keys.
+    ws_collapsed = re.sub(r"\s+", " ", normalized)
+    if ws_collapsed != normalized and ws_collapsed in ref_to_local:
+        return ref_to_local[ws_collapsed]
     base = Path(normalized).name
     if base and base in ref_to_local:
         return ref_to_local[base]
@@ -507,16 +664,34 @@ def _sanitize_doc_name(stem: str) -> str:
     return cleaned or "document"
 
 
+def _clean_unpack_dir(out_dir: Path) -> None:
+    """Remove only the files *this* unpack manages before a retry.
+
+    Clears ``document.md``, ``document.html``, and the ``images/`` tree so a
+    re-unpack of the same source never serves stale images from a prior run
+    (e.g. a retry after a failed compile, where the archive's image set may
+    have changed). Scoped to just these artifacts — anything else a future
+    caller drops under ``out_dir`` is left alone.
+    """
+    for name in ("document.md", "document.html"):
+        (out_dir / name).unlink(missing_ok=True)
+    images = out_dir / "images"
+    if images.is_dir():
+        shutil.rmtree(images, ignore_errors=True)
+
+
 def unpack_mhtml(
     mhtml_path: Path, out_dir: Path, *, doc_name: str | None = None
 ) -> MHTMLPrepareResult:
     """Unpack an MHTML archive into ``out_dir/document.md`` + ``out_dir/images/``.
 
     Writes the PageIndex-ready Markdown and returns its path. ``out_dir`` is
-    created if missing; existing contents (a prior unpack of the same source)
-    are overwritten in place so retries keep a stable name.
+    created if missing. Stale artifacts from a prior unpack of the same source
+    (a retry after a failed compile, where the image set may have changed) are
+    cleared first so old images can't leak into the new run.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    _clean_unpack_dir(out_dir)
     image_dir = out_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     resolved_doc_name = doc_name or _sanitize_doc_name(mhtml_path.stem)
@@ -542,7 +717,7 @@ def unpack_mhtml(
         if not keys:
             continue
         counter += 1
-        ext = _ext_for_content_type(part.get_content_type())
+        ext = _ext_for_image(part)
         filename = f"img{counter:03d}{ext}"
         (image_dir / filename).write_bytes(_payload_bytes(part))
         rel = f"./images/{filename}"
@@ -582,17 +757,28 @@ def unpack_mhtml(
 
 
 def prepare_mhtml_for_pageindex(
-    mhtml_path: Path, kb_dir: Path, *, doc_name: str | None = None
+    mhtml_path: Path,
+    kb_dir: Path,
+    *,
+    doc_name: str | None = None,
+    artifact_root: Path | None = None,
 ) -> MHTMLPrepareResult:
     """Prepare an MHTML archive for PageIndex consumption.
 
     Stages the unpacked Markdown + images under
-    ``<kb>/.openkb/mhtml_assets/<doc_name>/`` — a PageIndex-managed artifact
-    root, deliberately *not* ``wiki/sources/images`` (the short-doc image tree).
-    PageIndex owns the lifecycle of this input.
+    ``<artifact_root>/.openkb/mhtml_assets/<doc_name>/`` — a PageIndex-managed
+    artifact root, deliberately *not* ``wiki/sources/images`` (the short-doc
+    image tree). PageIndex owns the lifecycle of this input.
+
+    ``artifact_root`` defaults to ``kb_dir`` (the live KB). When ``convert_document``
+    is staging, it passes the staging dir so the assets land under the staged
+    ``.openkb/mhtml_assets/`` tree and are relocated by ``publish_staged_tree``
+    on commit — keeping them inside the add mutation's transaction so a failed
+    compile/index rolls them back instead of leaving them orphaned in the live KB.
     """
     resolved_doc_name = doc_name or _sanitize_doc_name(mhtml_path.stem)
-    out_dir = kb_dir / ".openkb" / "mhtml_assets" / resolved_doc_name
+    root = artifact_root if artifact_root is not None else kb_dir
+    out_dir = root / ".openkb" / "mhtml_assets" / resolved_doc_name
     return unpack_mhtml(mhtml_path, out_dir, doc_name=resolved_doc_name)
 
 

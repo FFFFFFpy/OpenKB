@@ -376,17 +376,35 @@ def index_mhtml_document(
         start = 1
         while start <= max_index:
             end = min(start + _CLOUD_PAGE_WINDOW - 1, max_index)
-            try:
-                window = _normalize_page_content(col.get_page_content(doc_id, f"{start}-{end}"))
-            except Exception as exc:
-                logger.warning(
-                    "MHTML get_page_content failed for %s (%d-%d): %s",
-                    markdown_path.name,
-                    start,
-                    end,
-                    exc,
-                )
-                break
+            # A window read must not silently truncate the document: if the
+            # first few windows succeed and a later one fails, breaking here
+            # would write partial page content and return success — the user
+            # gets an index that's missing sections with no signal. Retry the
+            # window a couple of times (PageIndex's parse can be transient),
+            # then raise so the caller rolls back the whole add.
+            window: list[dict[str, Any]] = []
+            last_exc: Exception | None = None
+            for attempt in range(1, _WINDOW_MAX_RETRIES + 1):
+                try:
+                    window = _normalize_page_content(col.get_page_content(doc_id, f"{start}-{end}"))
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "MHTML get_page_content failed for %s (%d-%d), attempt %d/%d: %s",
+                        markdown_path.name,
+                        start,
+                        end,
+                        attempt,
+                        _WINDOW_MAX_RETRIES,
+                        exc,
+                    )
+            if last_exc is not None:
+                raise RuntimeError(
+                    f"PageIndex page read failed for {markdown_path.name} "
+                    f"(pages {start}-{end}) after {_WINDOW_MAX_RETRIES} attempts: {last_exc}"
+                ) from last_exc
             all_pages.extend(window)
             start = end + 1
 
@@ -414,6 +432,10 @@ _CLOUD_PAGE_WINDOW = 1000
 # Safety bound on the windowed fetch (in pages) in case a backend never returns
 # a short window — caps the loop at _CLOUD_PAGE_MAX / _CLOUD_PAGE_WINDOW calls.
 _CLOUD_PAGE_MAX = 1_000_000
+# Retries for a single MHTML page window before failing the whole index. A
+# failing window must NOT silently truncate the document — exhaust these, then
+# raise so the caller rolls back the add instead of writing partial content.
+_WINDOW_MAX_RETRIES = 3
 
 
 def _fetch_cloud_pages(col, doc_id: str) -> list[dict[str, Any]]:
