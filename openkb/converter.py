@@ -31,6 +31,12 @@ class ConvertResult:
     skipped: bool = False
     file_hash: str | None = None  # For deferred hash registration
     doc_name: str | None = None  # Stable wiki name (collision-resistant)
+    # Path of a PageIndex-managed long-doc input (e.g. the prepared Markdown
+    # for an MHTML archive under .openkb/mhtml_assets/). Unlike short-doc
+    # ``source_path`` this is NOT a wiki source — it lives outside wiki/sources
+    # and is consumed directly by the indexer. ``None`` for short docs and
+    # long PDFs (which index from ``raw_path``).
+    pageindex_source: Path | None = None
 
 
 def _registry_path(path: Path, kb_dir: Path) -> str:
@@ -197,9 +203,29 @@ def convert_document(
             shutil.copy2(src, raw_dest)
 
         # ------------------------------------------------------------------
-        # 3. PDF long-doc detection
+        # 3. Long-doc detection: MHTML always, PDF only past threshold
         # ------------------------------------------------------------------
-        if src.suffix.lower() == ".pdf":
+        suffix_lower = src.suffix.lower()
+
+        if suffix_lower in {".mhtml", ".mht"}:
+            # MHTML is a long-doc container by nature (structured web pages).
+            # Unpack to a PageIndex-ready Markdown + images dir under
+            # .openkb/mhtml_assets/<doc_name>/. Never reaches the short-doc /
+            # MarkItDown branch below. The prepared Markdown is a PageIndex-
+            # managed input (not a wiki source), carried on pageindex_source.
+            from openkb.mhtml import prepare_mhtml_for_pageindex
+
+            prepared = prepare_mhtml_for_pageindex(raw_dest, kb_dir, doc_name=doc_name)
+            logger.info("MHTML prepared for PageIndex: %s", prepared.markdown_path)
+            return ConvertResult(
+                raw_path=raw_dest,
+                is_long_doc=True,
+                file_hash=file_hash,
+                doc_name=doc_name,
+                pageindex_source=prepared.markdown_path,
+            )
+
+        if suffix_lower == ".pdf":
             page_count = get_pdf_page_count(src)
             if page_count >= threshold:
                 logger.info(

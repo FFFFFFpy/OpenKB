@@ -236,6 +236,8 @@ SUPPORTED_EXTENSIONS = {
     ".xls",
     ".html",
     ".htm",
+    ".mhtml",
+    ".mht",
     ".txt",
     ".csv",
 }
@@ -244,13 +246,15 @@ SUPPORTED_EXTENSIONS = {
 _TYPE_DISPLAY_MAP = {
     "long_pdf": "pageindex",
     "pageindex_cloud": "pageindex",
+    "mhtml": "pageindex",
+    "mht": "pageindex",
 }
 
 # Registry types that were compiled via the long-doc pipeline (tree + per-page
-# JSON source), as opposed to short docs (markdown source). Both the local
-# long-PDF type and cloud imports belong here — they share the long-doc
-# summary/source layout and recompile path.
-_LONG_DOC_TYPES = {"long_pdf", "pageindex_cloud"}
+# JSON source), as opposed to short docs (markdown source). Local long-PDFs,
+# cloud imports, and MHTML web archives all belong here — they share the
+# long-doc summary/source layout and recompile path.
+_LONG_DOC_TYPES = {"long_pdf", "pageindex_cloud", "mhtml", "mht"}
 
 
 def _is_long_doc(meta: dict) -> bool:
@@ -522,9 +526,19 @@ def _add_single_file_locked(
             files_root = kb_dir / ".openkb" / "files"
             blobs_before = set(files_root.glob("*/*")) if files_root.exists() else set()
             try:
-                from openkb.indexer import index_long_document
+                if file_path.suffix.lower() in {".mhtml", ".mht"}:
+                    from openkb.indexer import index_mhtml_document
 
-                index_result = index_long_document(result.raw_path, kb_dir, doc_name=doc_name)
+                    mhtml_source = result.pageindex_source
+                    if mhtml_source is None:
+                        raise RuntimeError(
+                            f"Converted MHTML has no PageIndex markdown: {file_path.name}"
+                        )
+                    index_result = index_mhtml_document(mhtml_source, kb_dir, doc_name=doc_name)
+                else:
+                    from openkb.indexer import index_long_document
+
+                    index_result = index_long_document(result.raw_path, kb_dir, doc_name=doc_name)
             except Exception as exc:
                 click.echo(f"  [ERROR] Indexing failed: {exc}")
                 logger.debug("Indexing traceback:", exc_info=True)
@@ -570,13 +584,21 @@ def _add_single_file_locked(
         # Register hash only after successful compilation.
         if result.file_hash:
             registry = HashRegistry(openkb_dir / "hashes.json")
-            doc_type = "long_pdf" if result.is_long_doc else file_path.suffix.lstrip(".")
+            suffix_lower = file_path.suffix.lower()
+            if suffix_lower in {".mhtml", ".mht"}:
+                doc_type = suffix_lower.lstrip(".")
+            elif result.is_long_doc:
+                doc_type = "long_pdf"
+            else:
+                doc_type = suffix_lower.lstrip(".")
             meta = {
                 "name": file_path.name,
                 "doc_name": doc_name,
                 "type": doc_type,
                 "path": _registry_path(file_path, kb_dir),
             }
+            if suffix_lower in {".mhtml", ".mht"}:
+                meta["source_format"] = "web_archive"
             if result.raw_path is not None:
                 meta["raw_path"] = _registry_path(result.raw_path, kb_dir)
             if result.source_path is not None:
@@ -1342,13 +1364,14 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
 
     actions.append(("REGISTRY", f"remove hash entry  ({file_hash[:12]}…)"))
 
-    # Long PDFs leave state in PageIndex's local store (`.openkb/pageindex.db`
-    # row + `.openkb/files/<collection>/<doc_id>.pdf` + extracted images).
-    # Only flag this when both the registry says long_pdf and PageIndex
-    # state exists on disk — short-doc-only KBs never created any.
+    # Long PDFs and MHTML web archives leave state in PageIndex's local store
+    # (`.openkb/pageindex.db` row + `.openkb/files/<collection>/<doc_id>.*` +
+    # extracted images). Only flag this when both the registry type is a
+    # PageIndex-backed long doc and PageIndex state exists on disk —
+    # short-doc-only KBs never created any.
     pageindex_doc_id = meta.get("doc_id")
     pageindex_state_exists = (openkb_dir / "pageindex.db").exists()
-    cleanup_pageindex = doc_type == "long_pdf" and pageindex_state_exists
+    cleanup_pageindex = doc_type in {"long_pdf", "mhtml", "mht"} and pageindex_state_exists
     if cleanup_pageindex:
         if pageindex_doc_id:
             actions.append(

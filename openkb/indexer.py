@@ -271,6 +271,142 @@ def index_long_document(pdf_path: Path, kb_dir: Path, doc_name: str | None = Non
         raise
 
 
+def _max_page_index(structure: list) -> int:
+    """Return the largest ``start_index``/``end_index`` in a PageIndex tree.
+
+    Markdown-input trees key their nodes by source line number, which can far
+    exceed a doc's section count. ``get_page_content`` rejects ranges over 1000
+    pages (``parse_pages``), so windowing the fetch against this upper bound
+    keeps it from truncating without requesting an oversized range.
+    """
+    best = 0
+    for node in structure or []:
+        if not isinstance(node, dict):
+            continue
+        for key in ("start_index", "end_index"):
+            try:
+                best = max(best, int(node.get(key)))
+            except (TypeError, ValueError):
+                pass
+        best = max(best, _max_page_index(node.get("nodes", [])))
+    return best
+
+
+def index_mhtml_document(
+    markdown_path: Path, kb_dir: Path, doc_name: str | None = None
+) -> IndexResult:
+    """Index an MHTML archive's prepared Markdown via PageIndex.
+
+    *markdown_path* is the PageIndex-ready Markdown produced by
+    :func:`openkb.mhtml.prepare_mhtml_for_pageindex`. PageIndex's
+    :class:`MarkdownParser` builds the structure tree from its headings —
+    preserving the page's section hierarchy that the short-doc path would
+    flatten. Per-page content is read back from PageIndex's cached markdown
+    pages (windowed around the 1000-page ``parse_pages`` cap), so unlike the
+    PDF path there is no cloud-OCR fallback or per-page image extractor.
+    """
+    source_name = doc_name or markdown_path.stem
+    openkb_dir = kb_dir / ".openkb"
+    config = load_config(openkb_dir / "config.yaml")
+
+    model: str = config.get("model", "gpt-5.4")
+    pageindex_api_key = os.environ.get("PAGEINDEX_API_KEY", "")
+
+    index_config = IndexConfig(
+        if_add_node_text=True,
+        if_add_node_summary=True,
+        if_add_doc_description=True,
+    )
+    client = PageIndexClient(
+        api_key=pageindex_api_key or None,
+        model=model,
+        storage_path=str(openkb_dir),
+        index_config=index_config,
+    )
+    col = client.collection()
+
+    max_retries = 3
+    doc_id = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            doc_id = col.add(str(markdown_path))
+            logger.info(
+                "PageIndex added %s → doc_id=%s (attempt %d)",
+                markdown_path.name,
+                doc_id,
+                attempt,
+            )
+            break
+        except Exception as exc:
+            logger.warning(
+                "PageIndex attempt %d/%d failed for %s: %s",
+                attempt,
+                max_retries,
+                markdown_path.name,
+                exc,
+            )
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"Failed to index {markdown_path.name} after {max_retries} attempts: {exc}"
+                ) from exc
+
+    try:
+        doc = col.get_document(doc_id, include_text=True)
+        indexed_doc_name: str = doc.get("doc_name", markdown_path.stem)
+        description: str = doc.get("doc_description", "")
+        structure: list = doc.get("structure", [])
+
+        logger.info("Doc keys: %s", list(doc.keys()))
+        logger.info("page_count from doc: %s", doc.get("page_count", "NOT PRESENT"))
+
+        tree = {
+            "doc_name": indexed_doc_name,
+            "doc_description": description,
+            "structure": structure,
+        }
+
+        # Markdown pages are cached by MarkdownParser; fetch them windowed
+        # around the 1000-page parse_pages cap. Node indices are line numbers,
+        # so the upper bound comes from the tree's own start/end_index values.
+        # Unlike the cloud PDF path, markdown node indices are SPARSE (a section
+        # at line 1500 leaves lines 2-1499 without a node), so a short window is
+        # NOT a stop signal — we drive the loop purely by max_index.
+        max_index = _max_page_index(structure) or 1
+        all_pages: list[dict[str, Any]] = []
+        start = 1
+        while start <= max_index:
+            end = min(start + _CLOUD_PAGE_WINDOW - 1, max_index)
+            try:
+                window = _normalize_page_content(col.get_page_content(doc_id, f"{start}-{end}"))
+            except Exception as exc:
+                logger.warning(
+                    "MHTML get_page_content failed for %s (%d-%d): %s",
+                    markdown_path.name,
+                    start,
+                    end,
+                    exc,
+                )
+                break
+            all_pages.extend(window)
+            start = end + 1
+
+        if not all_pages:
+            raise RuntimeError(f"No page content extracted for {markdown_path.name}")
+
+        _write_long_doc_artifacts(
+            tree, all_pages, source_name, doc_id, kb_dir, description=description
+        )
+        return IndexResult(doc_id=doc_id, description=description, tree=tree)
+    except BaseException:
+        try:
+            col.delete_document(doc_id)
+        except Exception:
+            logger.warning(
+                "PageIndex cleanup of %s failed after error; blob may be orphaned", doc_id
+            )
+        raise
+
+
 # PageIndex's get_page_content rejects a single page range covering more than
 # this many pages (``parse_pages`` raises "Page range too large (max 1000)"),
 # so cloud page fetches are windowed in chunks of this size.
