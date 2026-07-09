@@ -5,4 +5,5 @@
 # commit by `git add -A`. To publish a new doc, add a `!its-name.md` line.
 *
 !.gitignore
+!browser_llm_article_to_markdown.md
 !golden-principles.md

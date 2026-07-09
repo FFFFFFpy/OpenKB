@@ -24,8 +24,9 @@ from openkb.okf.llm import (
     resolve_config,
 )
 from openkb.okf.markdown import split_sections
+from openkb.okf.prompts import summary_messages
 
-_MD = "# T\n\n## Intro\n\nHello world of transformers.\n"
+_MD = "# T\n\n## Intro\n\nHello world of transformers.\n\n## Details\n\nMore context.\n"
 
 
 def _extract_with_json(client: LLMClient, md: str, sections, *, responses):
@@ -326,6 +327,17 @@ def test_relations_prompt_receives_prior_concepts_and_entities():
     assert "MUST be exact names from the prior" in relations_call
 
 
+def test_prompt_section_map_includes_section_ids_and_anchors():
+    md = "# T\n\n### A\n\n**|Anchor One**\n\n### B\n\nBody\n"
+    sections = split_sections(md)
+
+    _system, user = summary_messages(md, sections, "zh")
+
+    assert "s0001 | A | lines" in user
+    assert "anchors:" in user
+    assert "a0001 | Anchor One | line" in user
+
+
 def test_relation_with_unknown_subject_or_object_is_dropped():
     sections = split_sections(_MD)
     responses = [
@@ -343,6 +355,28 @@ def test_relation_with_unknown_subject_or_object_is_dropped():
 
     assert out.relations == []
     assert any("subject/object" in w for w in out.warnings)
+
+
+def test_extract_evidence_section_id_is_validated():
+    sections = split_sections(_MD)
+    responses = [
+        '{"summary": "s"}',
+        '{"concepts": ['
+        '{"name": "Good", "description": "d", "evidence": '
+        '{"section_id": "s0001", "heading_path": "Intro", "line_start": 3, "line_end": 5}},'
+        '{"name": "Bad", "description": "d", "evidence": '
+        '{"section_id": "s9999", "heading_path": "Intro", "line_start": 3, "line_end": 5}}'
+        "]}",
+        '{"entities": []}',
+        '{"relations": []}',
+    ]
+    client = LLMClient(LLMConfig(base_url="https://x/v1", model="m", api_key="sk-x"))
+
+    out = _extract_with_json(client, _MD, sections, responses=responses)
+
+    assert [c.name for c in out.concepts] == ["Good"]
+    assert out.concepts[0].evidence.section_id == "s0001"
+    assert any("dropped 1" in w and "concept" in w for w in out.warnings)
 
 
 def test_api_key_redacted_from_exception_warning():

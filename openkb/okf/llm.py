@@ -200,11 +200,19 @@ def _evidence_from(obj: dict) -> Evidence | None:
     if not isinstance(ev, dict):
         return None
     heading = ev.get("heading_path")
+    section_id = ev.get("section_id")
     ls = ev.get("line_start")
     le = ev.get("line_end")
     if not isinstance(heading, str) or not isinstance(ls, int) or not isinstance(le, int):
         return None
-    return Evidence(heading_path=heading, line_start=ls, line_end=le)
+    if section_id is not None and not isinstance(section_id, str):
+        return None
+    return Evidence(
+        heading_path=heading,
+        line_start=ls,
+        line_end=le,
+        section_id=section_id.strip() if isinstance(section_id, str) else "",
+    )
 
 
 class LLMClient:

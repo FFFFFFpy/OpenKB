@@ -19,6 +19,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from openkb.okf.assets import collect_images, count_missing
 from openkb.okf.bundle import write_zip
@@ -126,7 +127,8 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
     try:
         workdir = _create_workdir(opts)
         markdown = input_md.read_text(encoding="utf-8")
-        sections = split_sections(markdown)
+        sectioning = split_sections(markdown)
+        sections = sectioning.sections
         if not sections:
             sections = [
                 SectionSpec(
@@ -191,6 +193,7 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
             llm_enabled=llm_enabled,
             model=model_recorded,
             warnings=warnings,
+            sectioning=sectioning,
         )
         write_zip(workdir, out)
         return CompileResult(
@@ -262,6 +265,7 @@ def compile_dir(
     max_workers: int = 1,
     fail_fast: bool = False,
     report_path: Path | None = None,
+    progress_callback: Callable[[CompileResult, int, int], None] | None = None,
 ) -> BatchReport:
     """Compile every Markdown file under ``input_dir`` into its own ``.okf.zip``.
 
@@ -284,6 +288,13 @@ def compile_dir(
         output_root=out_dir,
         api_key=opts.llm_config.api_key if opts.llm_config else None,
     )
+    completed = 0
+
+    def _record_progress(result: CompileResult) -> None:
+        nonlocal completed
+        completed += 1
+        if progress_callback is not None:
+            progress_callback(result, completed, report.total)
 
     if not inputs:
         logger.warning("compile-dir: no Markdown files found under %s (mode=%s)", input_dir, mode)
@@ -300,6 +311,7 @@ def compile_dir(
             )
         )
         report.skipped += 1
+        _record_progress(report.results[-1])
 
     # When skip_existing is on, drop already-compiled targets up front so they
     # don't consume a worker slot (and so the report reflects the real work).
@@ -317,6 +329,7 @@ def compile_dir(
                 CompileResult(md, zip_path, ok=False, skipped=True, error="already compiled")
             )
             report.skipped += 1
+            _record_progress(report.results[-1])
             continue
         pending.append((md, zip_path))
 
@@ -345,6 +358,8 @@ def compile_dir(
                 report.skipped += 1
             else:
                 report.failed += 1
+            _record_progress(r)
+            if not r.ok and not r.skipped:
                 if fail_fast:
                     failed_hard = True
                     break
@@ -370,6 +385,8 @@ def compile_dir(
                     report.skipped += 1
                 else:
                     report.failed += 1
+                _record_progress(r)
+                if not r.ok and not r.skipped:
                     if fail_fast:
                         failed_hard = True
                         # cancel remaining

@@ -60,6 +60,18 @@ SECTION_TYPE = "Section"
 
 
 @dataclass
+class SectionAnchor:
+    """A section-internal anchor discovered from subheadings or pseudo headings."""
+
+    anchor_id: str
+    title: str
+    raw: str
+    line_no: int
+    kind: str
+    markdown_level: int | None = None
+
+
+@dataclass
 class SectionSpec:
     """One H2-delimited section of the source Markdown.
 
@@ -75,12 +87,55 @@ class SectionSpec:
     line_start: int
     line_end: int
     body: str
+    section_id: str = ""
+    markdown_level: int | None = None
+    boundary_kind: str = "atx"
+    anchors: list[SectionAnchor] = field(default_factory=list)
 
     @property
     def filename(self) -> str:
         """Zip-relative path: ``sections/NN_slug.md``."""
         slug = _slugify(self.title) or "section"
         return f"{SECTIONS_DIR}/{self.index:0{SECTION_INDEX_WIDTH}d}_{slug}.md"
+
+
+@dataclass
+class SectioningResult:
+    """Result of conservative Markdown sectioning.
+
+    It intentionally behaves like a list for existing callers that only need
+    the sections, while carrying metadata for manifest/source-map consumers.
+    """
+
+    sections: list[SectionSpec]
+    strategy: str
+    effective_level: int | None
+    h_counts: dict[int, int]
+    section_count: int
+    anchor_count: int
+
+    def __iter__(self):
+        return iter(self.sections)
+
+    def __len__(self) -> int:
+        return len(self.sections)
+
+    def __getitem__(self, index):
+        return self.sections[index]
+
+    def __bool__(self) -> bool:
+        return bool(self.sections)
+
+    def to_manifest(self) -> dict:
+        data = {
+            "strategy": self.strategy,
+            "effective_level": self.effective_level,
+            "section_count": self.section_count,
+            "anchor_count": self.anchor_count,
+        }
+        for level in range(2, 7):
+            data[f"h{level}_count"] = self.h_counts.get(level, 0)
+        return data
 
 
 @dataclass
@@ -112,6 +167,7 @@ class Evidence:
     heading_path: str
     line_start: int
     line_end: int
+    section_id: str = ""
 
     def is_valid(self) -> bool:
         """Structural validity only (no section-map check).
@@ -139,6 +195,16 @@ def validate_evidence(
     section-range check is the primary gate, ``total_lines`` is a backstop.
     """
     if evidence is None or not evidence.is_valid():
+        return False
+    if evidence.section_id:
+        for sec in sections:
+            if sec.section_id != evidence.section_id:
+                continue
+            return (
+                sec.line_start <= evidence.line_start <= sec.line_end
+                and sec.line_start <= evidence.line_end <= sec.line_end
+                and evidence.line_end >= evidence.line_start
+            )
         return False
     for sec in sections:
         if sec.heading_path != evidence.heading_path:

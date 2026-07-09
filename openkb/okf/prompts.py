@@ -26,9 +26,9 @@ Critical rules:
 - You see only this one article. Treat every concept/entity as LOCAL to it. \
 Do NOT assume a global wiki exists; do NOT emit links to other documents.
 - Every concept, entity, and relation MUST include an `evidence` object with \
-`heading_path`, `line_start`, and `line_end`. These must point at real lines \
-in the article (use the provided section map). An extract with no evidence or \
-out-of-range evidence is invalid and will be dropped.
+`section_id`, `heading_path`, `line_start`, and `line_end`. These must point \
+at real lines in the article (use the provided section map). An extract with \
+no evidence or out-of-range evidence is invalid and will be dropped.
 - `line_start`/`line_end` are 1-indexed and inclusive, matching the section \
 map below exactly.
 - Be concrete and faithful. Do not speculate beyond what the article says.
@@ -36,12 +36,17 @@ map below exactly.
 
 
 def _section_map(sections: list[SectionSpec]) -> str:
-    """Render the H2 section list with heading path + line range for citation."""
+    """Render section ids, headings, line ranges, and anchors for citation."""
     if not sections:
         return "(no sections)"
     lines = ["Section map (use these coordinates for evidence):"]
     for s in sections:
-        lines.append(f"- {s.heading_path} | lines {s.line_start}-{s.line_end}")
+        sid = s.section_id or f"s{s.index + 1:04d}"
+        lines.append(f"- {sid} | {s.heading_path} | lines {s.line_start}-{s.line_end}")
+        if s.anchors:
+            lines.append("  anchors:")
+            for a in s.anchors:
+                lines.append(f"  - {a.anchor_id} | {a.title} | line {a.line_no}")
     return "\n".join(lines)
 
 
@@ -120,7 +125,7 @@ def concepts_messages(
         '      "name": "<concept name>",\n'
         '      "description": "<one or two sentences>",\n'
         '      "confidence": <0.0-1.0>,\n'
-        '      "evidence": {"heading_path": "<section>", '
+        '      "evidence": {"section_id": "<section id>", "heading_path": "<section>", '
         '"line_start": <int>, "line_end": <int>}\n'
         "    }\n  ]\n"
         "}\n"
@@ -154,7 +159,7 @@ def entities_messages(
         '      "description": "<one sentence>",\n'
         '      "aliases": ["<alt name>", ...],\n'
         '      "confidence": <0.0-1.0>,\n'
-        '      "evidence": {"heading_path": "<section>", '
+        '      "evidence": {"section_id": "<section id>", "heading_path": "<section>", '
         '"line_start": <int>, "line_end": <int>}\n'
         "    }\n  ]\n"
         "}\n"
@@ -193,7 +198,7 @@ def relations_messages(
         '      "subject": "<one of the names listed above>",\n'
         '      "relation": "<relation type>",\n'
         '      "object": "<one of the names listed above>",\n'
-        '      "evidence": {"heading_path": "<section>", '
+        '      "evidence": {"section_id": "<section id>", "heading_path": "<section>", '
         '"line_start": <int>, "line_end": <int>},\n'
         '      "note": "<optional short note>"\n'
         "    }\n  ]\n"

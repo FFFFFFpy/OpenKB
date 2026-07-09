@@ -223,6 +223,12 @@ def compile_cmd(
     help="Abort the batch on the first failure (default: continue).",
 )
 @click.option(
+    "--progress/--no-progress",
+    "progress",
+    default=None,
+    help="Show file-level progress. Default: auto.",
+)
+@click.option(
     "--report",
     "report_path",
     type=click.Path(dir_okay=False, path_type=Path),
@@ -244,6 +250,7 @@ def compile_dir_cmd(
     no_llm,
     max_workers,
     fail_fast,
+    progress,
     report_path,
     language,
     max_concepts,
@@ -265,6 +272,7 @@ def compile_dir_cmd(
     )
     if report_path is None:
         report_path = Path(out_dir) / DEFAULT_REPORT_NAME
+    progress_callback = _progress_callback(input_dir, progress)
     report: BatchReport = compile_dir(
         input_dir,
         out_dir,
@@ -276,6 +284,7 @@ def compile_dir_cmd(
         max_workers=max_workers,
         fail_fast=fail_fast,
         report_path=report_path,
+        progress_callback=progress_callback,
     )
     click.echo(
         f"Done: {report.ok} ok, {report.skipped} skipped, "
@@ -344,6 +353,49 @@ def _resolve_single_out(input_md: Path, out: Path | None) -> Path:
     if out is not None:
         return Path(out)
     return input_md.with_suffix(OKF_ZIP_SUFFIX)
+
+
+def _progress_callback(input_root: Path, progress: bool | None):
+    if progress is False:
+        return None
+    root = Path(input_root).resolve()
+    is_tty = sys.stderr.isatty()
+    counts = {"ok": 0, "skipped": 0, "failed": 0}
+
+    def _emit(result, current: int, total: int) -> None:
+        if result.skipped:
+            status = "SKIP"
+            counts["skipped"] += 1
+        elif result.ok:
+            status = "OK"
+            counts["ok"] += 1
+        else:
+            status = "FAIL"
+            counts["failed"] += 1
+        name = _display_input(result.input_path, root)
+        if is_tty:
+            pct = int((current / total) * 100) if total else 100
+            msg = (
+                f"\rOKF compile  {current}/{total}  {pct}%  current: {name}  "
+                f"ok={counts['ok']} skipped={counts['skipped']} failed={counts['failed']}"
+            )
+            click.echo(msg, nl=False, err=True)
+            if current >= total:
+                click.echo("", err=True)
+            return
+        msg = f"[{current}/{total}] {status} {name}"
+        if not result.ok and result.error:
+            msg += f": {result.error}"
+        click.echo(msg)
+
+    return _emit
+
+
+def _display_input(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _print_result(result) -> None:

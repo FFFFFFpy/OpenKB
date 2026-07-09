@@ -1,12 +1,11 @@
-"""Split a Markdown article into H2-delimited sections (pure, no I/O).
+"""Conservative Markdown sectioning for OKF bundles.
 
-``#`` (H1) is the document root title, not a section. ``##`` is the section
-boundary. ``###``/``####`` and everything else stay inside the section they
-appear in. When the document has no ``##`` heading, a single
-``sections/00_document.md`` covers the whole body.
+Section boundaries come only from ATX headings (``##`` through ``######``).
+Pseudo headings such as ``|title`` or ``**|title**`` are recorded as anchors
+inside the current section; they never split sections.
 
 Line numbers are 1-indexed, inclusive, and match the physical lines of the
-input text exactly - these are the evidence coordinates the LLM cites and the
+input text exactly. These are the evidence coordinates the LLM cites and the
 ``sources/article.md`` reader sees, so they must not drift.
 """
 
@@ -14,15 +13,26 @@ from __future__ import annotations
 
 import re
 
-from openkb.okf.schema import SectionSpec
+from openkb.okf.schema import SectionAnchor, SectioningResult, SectionSpec
 
-# A line that starts (after optional spaces) with exactly two ``#`` followed
-# by a space or end-of-line. ``(?<!#)`` prevents ``###`` from matching as a
-# ``##`` (a common off-by-one when the third hash is consumed greedily), and
-# the negative lookahead ``(?!#)`` does the same for the ``##`` end.
-_H2_RE = re.compile(r"(?m)^[ \t]{0,3}##(?!#)[ \t]*(.*?)[ \t]*$")
-# ``#`` (exactly one) - the document root title.
+_ATX_RE = re.compile(r"^[ \t]{0,3}(#{1,6})(?!#)[ \t]*(.*?)[ \t]*#*[ \t]*$")
 _H1_RE = re.compile(r"(?m)^[ \t]{0,3}#(?!#)[ \t]*(.*?)[ \t]*$")
+
+_BOLD_PIPE_RE = re.compile(r"^\*\*\s*\|(.+?)\s*\*\*$")
+_BARE_PIPE_RE = re.compile(r"^\|(.+)$")
+_BOLD_RE = re.compile(r"^\*\*(.+?)\*\*$")
+_ORDINAL_RE = re.compile(
+    r"^(?:第[一二三四五六七八九十百千万]+[：:]|[一二三四五六七八九十]+、|\d+[.、]\s+)(.+)$"
+)
+
+_PLAYER_TEXT = {
+    "follow",
+    "replay",
+    "share",
+    "like",
+    "close",
+    "your browser does not support video tags",
+}
 
 
 def extract_title(md: str) -> str | None:
@@ -34,81 +44,259 @@ def extract_title(md: str) -> str | None:
     return title or None
 
 
-def split_sections(md: str) -> list[SectionSpec]:
-    """Split ``md`` into ``SectionSpec`` records by H2 boundaries.
+def split_sections(md: str, strategy: str = "auto") -> SectioningResult:
+    """Split ``md`` into conservative ``SectionSpec`` records.
 
-    The H1 root title (if any) is folded into the first section's body rather
-    than becoming its own section - the document root is not a section. H3/H4
-    and all body content stay in whichever section they appear under. A
-    document with zero ``##`` headings yields a single section spanning the
-    whole body (``00_document.md``).
-
-    ``line_start``/``line_end`` are 1-indexed and inclusive and count every
-    physical line (CRLF/LF normalized via :func:`str.splitlines` semantics of
-    the regex operating on the raw string - we index by character offsets then
-    map to line numbers).
+    ``strategy`` currently supports only ``auto``: choose the first ATX level
+    from H2..H6 with at least two headings. H1 is the document title, not a
+    section boundary. When no level has enough headings, the result is a
+    single whole-document section.
     """
-    if md == "":
-        return [_whole_doc_section(md, 0)]
+    lines = md.splitlines(keepends=True)
+    h_counts, headings = _scan_atx(lines)
+    effective_level = _effective_level(h_counts, strategy)
 
-    h2_matches = list(_H2_RE.finditer(md))
-    if not h2_matches:
-        return [_whole_doc_section(md, 0)]
+    if effective_level is None:
+        section = _whole_doc_section(md, h_counts)
+        return _result([section], h_counts, None)
 
+    boundary_indexes = [h["line_index"] for h in headings if h["level"] == effective_level]
     sections: list[SectionSpec] = []
-    # Heading path for a single-article bundle: the H2 title alone (no parent
-    # H1 segment) keeps evidence coordinates simple and unambiguous. We do not
-    # prepend the H1 title because the H1 is the document root, not a section
-    # ancestor.
-    for i, m in enumerate(h2_matches):
-        title = (m.group(1) or "").strip() or "(untitled)"
-        start = _line_at(md, m.start())
-        if i + 1 < len(h2_matches):
-            end = _line_at(md, h2_matches[i + 1].start()) - 1
-        else:
-            end = _line_count(md)
-        if end < start:
-            end = start
-        body = md[m.start() : (h2_matches[i + 1].start() if i + 1 < len(h2_matches) else len(md))]
+
+    first_boundary = boundary_indexes[0]
+    if first_boundary > 0 and _has_effective_preamble(lines[:first_boundary]):
+        body = "".join(lines[:first_boundary])
         sections.append(
             SectionSpec(
-                index=i,
-                title=title,
-                heading_path=title,
-                line_start=start,
-                line_end=end,
+                index=0,
+                title="preamble",
+                heading_path="preamble",
+                line_start=1,
+                line_end=first_boundary,
                 body=_strip_trailing_newline(body),
+                section_id="",
+                markdown_level=None,
+                boundary_kind="preamble",
             )
         )
-    return sections
+
+    for boundary_pos, start_index in enumerate(boundary_indexes):
+        next_start = (
+            boundary_indexes[boundary_pos + 1]
+            if boundary_pos + 1 < len(boundary_indexes)
+            else len(lines)
+        )
+        heading = _heading_at(headings, start_index)
+        title = heading["title"] or "(untitled)"
+        section_index = len(sections)
+        body = "".join(lines[start_index:next_start])
+        section = SectionSpec(
+            index=section_index,
+            title=title,
+            heading_path=title,
+            line_start=start_index + 1,
+            line_end=max(next_start, start_index + 1),
+            body=_strip_trailing_newline(body),
+            section_id="",
+            markdown_level=effective_level,
+            boundary_kind="atx",
+        )
+        sections.append(section)
+
+    _assign_ids_and_anchors(sections, lines, effective_level)
+    return _result(sections, h_counts, effective_level)
 
 
-def _whole_doc_section(md: str, index: int) -> SectionSpec:
-    """The single section used when the document has no H2 headings."""
+def _scan_atx(lines: list[str]) -> tuple[dict[int, int], list[dict]]:
+    h_counts = {level: 0 for level in range(2, 7)}
+    headings: list[dict] = []
+    for i, raw_line in enumerate(lines):
+        match = _ATX_RE.match(raw_line.rstrip("\r\n"))
+        if match is None:
+            continue
+        level = len(match.group(1))
+        title = (match.group(2) or "").strip() or "(untitled)"
+        headings.append({"line_index": i, "level": level, "title": title, "raw": raw_line})
+        if 2 <= level <= 6:
+            h_counts[level] += 1
+    return h_counts, headings
+
+
+def _effective_level(h_counts: dict[int, int], strategy: str) -> int | None:
+    if strategy not in {"auto", "auto_atx"}:
+        raise ValueError(f"unknown sectioning strategy: {strategy!r}")
+    for level in range(2, 7):
+        if h_counts.get(level, 0) >= 2:
+            return level
+    return None
+
+
+def _result(
+    sections: list[SectionSpec], h_counts: dict[int, int], effective_level: int | None
+) -> SectioningResult:
+    _assign_ids_and_anchors(sections, None, effective_level)
+    anchor_count = sum(len(s.anchors) for s in sections)
+    return SectioningResult(
+        sections=sections,
+        strategy="auto_atx",
+        effective_level=effective_level,
+        h_counts=dict(h_counts),
+        section_count=len(sections),
+        anchor_count=anchor_count,
+    )
+
+
+def _whole_doc_section(md: str, h_counts: dict[int, int]) -> SectionSpec:
     line_count = _line_count(md)
-    return SectionSpec(
-        index=index,
+    section = SectionSpec(
+        index=0,
         title="document",
         heading_path="document",
         line_start=1,
         line_end=max(line_count, 1),
         body=md,
+        section_id="s0001",
+        markdown_level=None,
+        boundary_kind="whole_doc",
+    )
+    _assign_ids_and_anchors([section], md.splitlines(keepends=True), None)
+    return section
+
+
+def _heading_at(headings: list[dict], line_index: int) -> dict:
+    for heading in headings:
+        if heading["line_index"] == line_index:
+            return heading
+    raise ValueError(f"missing heading at line index {line_index}")
+
+
+def _assign_ids_and_anchors(
+    sections: list[SectionSpec], lines: list[str] | None, effective_level: int | None
+) -> None:
+    anchor_seq = 1
+    for i, section in enumerate(sections, start=1):
+        section.index = i - 1
+        section.section_id = f"s{i:04d}"
+        if lines is None:
+            continue
+        start = section.line_start - 1
+        end = min(section.line_end, len(lines))
+        anchors: list[SectionAnchor] = []
+        for line_index in range(start, end):
+            if line_index == start and section.boundary_kind == "atx":
+                continue
+            anchor = _anchor_from_line(
+                lines[line_index],
+                line_no=line_index + 1,
+                anchor_id=f"a{anchor_seq:04d}",
+                effective_level=effective_level,
+            )
+            if anchor is None:
+                continue
+            anchors.append(anchor)
+            anchor_seq += 1
+        section.anchors = anchors
+
+
+def _anchor_from_line(
+    raw_line: str, *, line_no: int, anchor_id: str, effective_level: int | None
+) -> SectionAnchor | None:
+    raw = raw_line.rstrip("\r\n")
+    stripped = raw.strip()
+    if _reject_anchor_line(stripped):
+        return None
+
+    atx = _ATX_RE.match(raw)
+    if atx is not None:
+        level = len(atx.group(1))
+        if level == 1 or (effective_level is not None and level == effective_level):
+            return None
+        title = _clean_title(atx.group(2))
+        return _anchor(anchor_id, title, raw, line_no, "atx_subheading", level)
+
+    match = _BOLD_PIPE_RE.match(stripped)
+    if match is not None:
+        return _anchor(anchor_id, _clean_title("|" + match.group(1)), raw, line_no, "bold_pipe")
+
+    match = _BARE_PIPE_RE.match(stripped)
+    if match is not None:
+        return _anchor(anchor_id, _clean_title("|" + match.group(1)), raw, line_no, "bare_pipe")
+
+    match = _BOLD_RE.match(stripped)
+    if match is not None:
+        return _anchor(anchor_id, _clean_title(match.group(1)), raw, line_no, "bold")
+
+    match = _ORDINAL_RE.match(stripped)
+    if match is not None:
+        return _anchor(anchor_id, _clean_title(stripped), raw, line_no, "ordinal")
+
+    return None
+
+
+def _anchor(
+    anchor_id: str,
+    title: str,
+    raw: str,
+    line_no: int,
+    kind: str,
+    markdown_level: int | None = None,
+) -> SectionAnchor | None:
+    if not title or len(title) > 80:
+        return None
+    return SectionAnchor(
+        anchor_id=anchor_id,
+        title=title,
+        raw=raw,
+        line_no=line_no,
+        kind=kind,
+        markdown_level=markdown_level,
     )
 
 
-def _line_at(md: str, offset: int) -> int:
-    """1-indexed line number of the character at ``offset``."""
-    if offset <= 0:
-        return 1
-    return md.count("\n", 0, offset) + 1
+def _reject_anchor_line(stripped: str) -> bool:
+    if not stripped:
+        return True
+    lower = stripped.lower()
+    if lower in _PLAYER_TEXT:
+        return True
+    if stripped.startswith(("!", ">", "- [", "* [")):
+        return True
+    if stripped.startswith("|") and stripped.count("|") >= 2:
+        return True
+    if re.match(r"^[\-*_]{3,}$", stripped):
+        return True
+    if re.search(r"全文约?\d+字|阅读用时|相关阅读|本文完", stripped):
+        return True
+    return False
+
+
+def _has_effective_preamble(lines: list[str]) -> bool:
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if _reject_anchor_line(stripped):
+            continue
+        atx = _ATX_RE.match(raw_line.rstrip("\r\n"))
+        if atx is not None:
+            if len(atx.group(1)) == 1:
+                continue
+            return True
+        if len(stripped) >= 12:
+            return True
+    return False
+
+
+def _clean_title(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("**") and t.endswith("**") and len(t) >= 4:
+        t = t[2:-2].strip()
+    if t.startswith("|"):
+        t = t[1:].strip()
+    return t.strip()
 
 
 def _line_count(md: str) -> int:
-    """Number of lines (a trailing newline => one more empty line is NOT counted)."""
     if md == "":
         return 0
-    # splitlines handles trailing newline correctly: "a\n" -> ["a"] (1 line).
-    # For evidence, a final unterminated line still counts as a line.
     if md.endswith("\n"):
         return md.count("\n")
     return md.count("\n") + 1

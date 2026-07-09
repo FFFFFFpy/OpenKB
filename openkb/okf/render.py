@@ -47,6 +47,7 @@ from openkb.okf.schema import (
     Extracts,
     ImageRef,
     ProposedEdge,
+    SectioningResult,
     SectionSpec,
     manifest_compiler_block,
     okf_yaml_text,
@@ -68,6 +69,7 @@ def render_bundle(
     llm_enabled: bool,
     model: str | None,
     warnings: list[str],
+    sectioning: SectioningResult | None = None,
 ) -> dict:
     """Write the full OKF tree into ``workdir`` and return the manifest dict.
 
@@ -134,6 +136,7 @@ def render_bundle(
         "language": language or "en",
         "created_at": _now_iso(),
         "counts": counts,
+        "sectioning": _sectioning_manifest(sectioning, sections),
         # Portable inputs: a filename + byte count, never an absolute path.
         "inputs": {
             "source_md": ARTICLE_MD,
@@ -250,6 +253,7 @@ def _write_relations(workdir: Path, relations: list[ProposedEdge]) -> None:
             "object": r.object,
             "evidence": (
                 {
+                    "section_id": r.evidence.section_id,
                     "heading_path": r.evidence.heading_path,
                     "line_start": r.evidence.line_start,
                     "line_end": r.evidence.line_end,
@@ -281,11 +285,24 @@ def _build_source_map(
         "sections": [
             {
                 "file": sec.filename,
+                "section_id": sec.section_id,
                 "source": article,
                 "title": sec.title,
                 "heading_path": sec.heading_path,
                 "line_start": sec.line_start,
                 "line_end": sec.line_end,
+                "markdown_level": sec.markdown_level,
+                "boundary_kind": sec.boundary_kind,
+                "anchors": [
+                    {
+                        "anchor_id": a.anchor_id,
+                        "title": a.title,
+                        "line_no": a.line_no,
+                        "kind": a.kind,
+                        "markdown_level": a.markdown_level,
+                    }
+                    for a in sec.anchors
+                ],
             }
             for sec in sections
         ],
@@ -308,6 +325,7 @@ def _build_source_map(
                 "file": f"{CONCEPTS_DIR}/{_slugify(c.name)}.md",
                 "source": article,
                 "name": c.name,
+                "section_id": c.evidence.section_id if c.evidence else "",
                 "heading_path": c.evidence.heading_path if c.evidence else "",
                 "line_start": c.evidence.line_start if c.evidence else 0,
                 "line_end": c.evidence.line_end if c.evidence else 0,
@@ -320,6 +338,7 @@ def _build_source_map(
                 "source": article,
                 "name": e.name,
                 "type": e.entity_type,
+                "section_id": e.evidence.section_id if e.evidence else "",
                 "heading_path": e.evidence.heading_path if e.evidence else "",
                 "line_start": e.evidence.line_start if e.evidence else 0,
                 "line_end": e.evidence.line_end if e.evidence else 0,
@@ -333,6 +352,7 @@ def _build_source_map(
                 "subject": r.subject,
                 "relation": r.relation,
                 "object": r.object,
+                "section_id": r.evidence.section_id if r.evidence else "",
                 "heading_path": r.evidence.heading_path if r.evidence else "",
                 "line_start": r.evidence.line_start if r.evidence else 0,
                 "line_end": r.evidence.line_end if r.evidence else 0,
@@ -362,6 +382,22 @@ def _index_md(title: str, sections: list[SectionSpec], extracts: Extracts) -> st
             f"[{PROPOSED_EDGES_JSONL}]({PROPOSED_EDGES_JSONL})"
         )
     return "\n".join(lines) + "\n"
+
+
+def _sectioning_manifest(
+    sectioning: SectioningResult | None, sections: list[SectionSpec]
+) -> dict:
+    if sectioning is not None:
+        return sectioning.to_manifest()
+    data = {
+        "strategy": "unknown",
+        "effective_level": None,
+        "section_count": len(sections),
+        "anchor_count": sum(len(s.anchors) for s in sections),
+    }
+    for level in range(2, 7):
+        data[f"h{level}_count"] = 0
+    return data
 
 
 def _log_md(title: str, llm_enabled: bool, warnings: list[str]) -> str:

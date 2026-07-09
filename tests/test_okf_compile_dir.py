@@ -51,6 +51,50 @@ def test_flat_mode_multiple_zips(tmp_path):
             assert "manifest.json" in zf.namelist()
 
 
+def test_compile_dir_non_tty_progress_logs_per_file(tmp_path):
+    indir = tmp_path / "in"
+    indir.mkdir()
+    _make_md(indir / "a.md", "A")
+    _make_md(indir / "b.md", "B")
+    outdir = tmp_path / "out"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["okf", "compile-dir", str(indir), "--out", str(outdir), "--no-llm", "--mode", "flat"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\r" not in result.output
+    assert "[1/2] OK" in result.output
+    assert "[2/2] OK" in result.output
+
+
+def test_compile_dir_no_progress_suppresses_file_progress(tmp_path):
+    indir = tmp_path / "in"
+    indir.mkdir()
+    _make_md(indir / "a.md", "A")
+    outdir = tmp_path / "out"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "okf",
+            "compile-dir",
+            str(indir),
+            "--out",
+            str(outdir),
+            "--no-llm",
+            "--no-progress",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[1/1]" not in result.output
+    assert "Done:" in result.output
+
+
 def test_wechat_mode_picks_main_md_per_dir(tmp_path):
     indir = tmp_path / "in"
     indir.mkdir()
@@ -244,6 +288,8 @@ def test_wechat_ambiguous_dir_skipped_not_guessed(tmp_path):
     assert any(r["input"].endswith("ambiguous") for r in skip), skip
     assert data["total"] == 2
     assert data["ok"] + data["skipped"] + data["failed"] == data["total"]
+    assert "[1/2] SKIP ambiguous" in result.output
+    assert "[2/2] OK art1/art1.md" in result.output
 
 
 def test_flat_mode_excludes_obvious_non_source_dirs(tmp_path):
@@ -319,7 +365,7 @@ def test_exception_with_api_key_redacted_from_report(tmp_path, monkeypatch):
     report = tmp_path / "report.json"
     runner = CliRunner()
     # Pass the secret as the api_key so the redaction gate has it to strip.
-    runner.invoke(
+    result = runner.invoke(
         cli,
         [
             "okf",
@@ -335,9 +381,29 @@ def test_exception_with_api_key_redacted_from_report(tmp_path, monkeypatch):
             str(report),
         ],
     )
+    assert secret not in result.output
     data = json.loads(report.read_text(encoding="utf-8"))
     blob = json.dumps(data)
     assert secret not in blob, f"api_key leaked into batch report: {blob}"
     # the failed result recorded an error (redacted)
     failed = [r for r in data["results"] if r["status"] == "failed"]
     assert failed, data
+
+
+def test_progress_continues_after_failed_file(tmp_path):
+    indir = tmp_path / "in"
+    indir.mkdir()
+    _make_md(indir / "good.md", "Good")
+    (indir / "bad.md").write_bytes(b"\xff\xfe# Bad\n")
+    outdir = tmp_path / "out"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["okf", "compile-dir", str(indir), "--out", str(outdir), "--no-llm", "--mode", "flat"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[1/2] FAIL bad.md" in result.output
+    assert "[2/2] OK good.md" in result.output
+    assert "Done: 1 ok, 0 skipped, 1 failed (2 total)." in result.output

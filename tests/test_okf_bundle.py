@@ -108,6 +108,7 @@ def test_manifest_required_fields(tmp_path):
         "created_at",
         "counts",
         "inputs",
+        "sectioning",
         "compiler",
         "warnings",
     ):
@@ -133,6 +134,9 @@ def test_manifest_required_fields(tmp_path):
     for key in ("sections", "concepts", "entities", "relations", "images", "missing_assets"):
         assert key in counts, key
     assert counts["sections"] == 2
+    sectioning = manifest["sectioning"]
+    assert "effective_level" in sectioning
+    assert "anchor_count" in sectioning
 
 
 def test_api_key_absent_from_zip_contents(tmp_path):
@@ -243,6 +247,38 @@ def test_source_map_contains_extract_evidence(tmp_path):
     assert sm["relations"] and sm["relations"][0]["source"] == "sources/article.md"
     assert sm["relations"][0]["subject"] == "ConceptA"
     assert sm["relations"][0]["object"] == "EntityA"
+
+
+def test_source_map_and_manifest_include_sectioning_anchors(tmp_path):
+    md = "# T\n\n### A\n\n**|Anchor One**\n\n### B\n\n|Anchor Two\n"
+    sectioning = split_sections(md)
+    workdir = tmp_path / "wd"
+    manifest = render_bundle(
+        workdir,
+        markdown=md,
+        sections=sectioning.sections,
+        image_refs=[],
+        extracts=Extracts(),
+        original_filename="article.md",
+        title="T",
+        language="zh",
+        llm_enabled=False,
+        model=None,
+        warnings=[],
+        sectioning=sectioning,
+    )
+
+    assert manifest["sectioning"]["strategy"] == "auto_atx"
+    assert manifest["sectioning"]["effective_level"] == 3
+    assert manifest["sectioning"]["section_count"] == 2
+    assert manifest["sectioning"]["anchor_count"] == 2
+    sm = json.loads((workdir / "source_map.json").read_text(encoding="utf-8"))
+    first = sm["sections"][0]
+    assert first["section_id"] == "s0001"
+    assert first["markdown_level"] == 3
+    assert first["boundary_kind"] == "atx"
+    assert first["anchors"][0]["kind"] == "bold_pipe"
+    assert first["anchors"][0]["title"] == "Anchor One"
 
 
 def test_summary_and_concept_frontmatter(tmp_path):
