@@ -8,6 +8,7 @@ parent section.
 from __future__ import annotations
 
 from openkb.okf.markdown import extract_title, split_sections
+from openkb.okf.schema import Evidence, validate_evidence
 
 
 def test_h2_split_line_numbers_inclusive():
@@ -95,3 +96,11 @@ def test_line_numbers_match_sources_article_verbatim():
     assert sections[0].line_end == 3  # "line3"
     # the section body begins with the heading line
     assert sections[0].body.startswith("## S")
+
+
+def test_validate_evidence_accepts_later_duplicate_heading():
+    md = "# T\n\n## Repeat\n\nfirst\n\n## Repeat\n\nsecond\n"
+    sections = split_sections(md)
+
+    assert [s.heading_path for s in sections] == ["Repeat", "Repeat"]
+    assert validate_evidence(Evidence("Repeat", line_start=7, line_end=9), sections, 9)

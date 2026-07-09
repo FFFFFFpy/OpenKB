@@ -141,7 +141,7 @@ def render_bundle(
             "markdown_bytes": len(markdown.encode("utf-8")),
         },
         "compiler": manifest_compiler_block(llm_enabled=llm_enabled, model=model),
-        "warnings": list(warnings) + list(extracts.warnings),
+        "warnings": [redact_secrets(w) for w in list(warnings) + list(extracts.warnings)],
     }
     atomic_write_json(workdir / MANIFEST_JSON, manifest)
     return manifest
@@ -351,11 +351,11 @@ def _index_md(title: str, sections: list[SectionSpec], extracts: Extracts) -> st
     if extracts.concepts:
         lines.append(f"- Concepts ({len(extracts.concepts)})")
         for c in extracts.concepts:
-            lines.append(f"  - [{c.name}](concepts/{_slugify(c.name)}.md)")
+            lines.append(f"  - [{c.name}]({CONCEPTS_DIR}/{_slugify(c.name)}.md)")
     if extracts.entities:
         lines.append(f"- Entities ({len(extracts.entities)})")
         for e in extracts.entities:
-            lines.append(f"  - [{e.name}](entities/{_slugify(e.name)}.md)")
+            lines.append(f"  - [{e.name}]({ENTITIES_DIR}/{_slugify(e.name)}.md)")
     if extracts.relations:
         lines.append(
             f"- Relations ({len(extracts.relations)}) -> "

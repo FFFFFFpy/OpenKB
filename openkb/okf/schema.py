@@ -141,12 +141,14 @@ def validate_evidence(
     if evidence is None or not evidence.is_valid():
         return False
     for sec in sections:
-        if sec.heading_path == evidence.heading_path:
-            return (
-                sec.line_start <= evidence.line_start <= sec.line_end
-                and sec.line_start <= evidence.line_end <= sec.line_end
-                and evidence.line_end >= evidence.line_start
-            )
+        if sec.heading_path != evidence.heading_path:
+            continue
+        if (
+            sec.line_start <= evidence.line_start <= sec.line_end
+            and sec.line_start <= evidence.line_end <= sec.line_end
+            and evidence.line_end >= evidence.line_start
+        ):
+            return True
     # No matching section. If there are no sections at all (whole-doc), accept
     # any in-document range; otherwise reject.
     if not sections:

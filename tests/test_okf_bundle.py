@@ -9,10 +9,12 @@ any file inside the zip.
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from pathlib import Path
 
 from openkb.okf.bundle import write_zip
+from openkb.okf.compiler import CompileResult
 from openkb.okf.markdown import split_sections
 from openkb.okf.render import render_bundle
 from openkb.okf.schema import (
@@ -266,6 +268,73 @@ def test_summary_and_concept_frontmatter(tmp_path):
     assert 'type: "Local Concept"' in concept
     assert 'source: "sources/article.md"' in concept
     assert "confidence: 0.9" in concept
+
+
+def test_index_links_point_to_existing_bundle_files(tmp_path):
+    """Every index.md link should resolve to an emitted bundle path."""
+    workdir = tmp_path / "wd"
+    render_bundle(
+        workdir,
+        markdown=_MD,
+        sections=split_sections(_MD),
+        image_refs=[],
+        extracts=_extracts_with_evidence(),
+        original_filename="article.md",
+        title="My Article",
+        language="zh",
+        llm_enabled=True,
+        model="openai/gpt-4o",
+        warnings=[],
+    )
+    out = tmp_path / "out.okf.zip"
+    write_zip(workdir, out)
+
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+        index = zf.read("index.md").decode("utf-8")
+
+    links = re.findall(r"\]\(([^)]+)\)", index)
+    assert "extracts/concepts/concepta.md" in links
+    assert "extracts/entities/entitya.md" in links
+    for link in links:
+        assert link in names, f"{link} from index.md is missing from bundle"
+
+
+def test_authorization_bearer_redacted_from_warnings_report_and_log(tmp_path):
+    token_a = "token-SECRET-1234567890"
+    token_b = "token-SECRET-0987654321"
+    warning = (
+        f"upstream failed with Authorization: Bearer {token_a}; "
+        f"retry used Authorization=Bearer {token_b}"
+    )
+    workdir = tmp_path / "wd"
+    manifest = render_bundle(
+        workdir,
+        markdown=_MD,
+        sections=split_sections(_MD),
+        image_refs=[],
+        extracts=Extracts(),
+        original_filename="article.md",
+        title="My Article",
+        language="zh",
+        llm_enabled=True,
+        model="openai/gpt-4o",
+        warnings=[warning],
+    )
+
+    report = CompileResult(
+        tmp_path / "article.md",
+        tmp_path / "article.okf.zip",
+        ok=False,
+        error=warning,
+        warnings=[warning],
+    ).to_report()
+    log_text = (workdir / "log.md").read_text(encoding="utf-8")
+    blob = json.dumps({"manifest": manifest, "report": report, "log": log_text})
+
+    assert token_a not in blob
+    assert token_b not in blob
+    assert "Authorization: Bearer [REDACTED]" in blob
 
 
 def test_no_absolute_paths_in_zip_text_files(tmp_path):

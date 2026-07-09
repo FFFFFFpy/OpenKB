@@ -54,6 +54,10 @@ _DEFAULT_TIMEOUT = 120.0
 # reach a persisted surface (manifest warnings, batch_report errors, log.md,
 # CLI output) so an exception carrying a key/token never leaks out.
 _SK_PATTERN = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
+_AUTH_BEARER_PATTERN = re.compile(
+    r"\bAuthorization\s*[:=]\s*Bearer\s+([A-Za-z0-9_\-\.]{8,})",
+    re.IGNORECASE,
+)
 _BEARER_PATTERN = re.compile(
     r"(Authorization|Bearer)\s*[:=]?\s*[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE
 )
@@ -74,6 +78,7 @@ def redact_secrets(text: str, api_key: str | None = None) -> str:
         out = text
         if api_key and api_key.strip():
             out = out.replace(api_key, _REDACTED)
+        out = _AUTH_BEARER_PATTERN.sub("Authorization: Bearer " + _REDACTED, out)
         out = _SK_PATTERN.sub(_REDACTED, out)
         out = _BEARER_PATTERN.sub(lambda m: m.group(1) + ": " + _REDACTED, out)
         return out
