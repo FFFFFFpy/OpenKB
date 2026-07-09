@@ -283,3 +283,76 @@ def test_llmclient_requires_model():
     cfg = LLMConfig(base_url="https://x/v1", model=None, api_key="sk-x")
     with pytest.raises(ValueError):
         LLMClient(cfg)
+
+
+def test_relations_prompt_receives_prior_concepts_and_entities():
+    """The relations call must be passed the prior concepts + entities so it
+    picks subject/object from those names rather than re-inferring them.
+    """
+    sections = split_sections(_MD)
+    captured: list[str] = []
+
+    responses = [
+        '{"summary": "s"}',
+        '{"concepts": [{"name": "Attention", "description": "d", "evidence": '
+        '{"heading_path": "Intro", "line_start": 3, "line_end": 5}}]}',
+        '{"entities": [{"name": "Google", "type": "organization", "description": "d", '
+        '"evidence": {"heading_path": "Intro", "line_start": 3, "line_end": 5}}]}',
+        '{"relations": []}',
+    ]
+    it = iter(responses)
+
+    def fake_json(system: str, user: str) -> str:
+        captured.append(user)
+        return next(it)
+
+    client = LLMClient(LLMConfig(base_url="https://x/v1", model="m", api_key="sk-x"))
+    with patch.object(LLMClient, "json_completion", side_effect=fake_json):
+        extract(client, _MD, sections, language="en", max_concepts=12, max_entities=12)
+
+    # 4 calls: summary, concepts, entities, relations
+    assert len(captured) == 4
+    concepts_call = captured[1]
+    entities_call = captured[2]
+    relations_call = captured[3]
+    # concepts call sees the prior summary
+    assert "Prior summary" in concepts_call
+    # entities call sees prior summary + prior concepts
+    assert "Attention" in entities_call
+    assert "Prior summary" in entities_call
+    # relations call sees prior concepts AND entities
+    assert "Attention" in relations_call
+    assert "Google" in relations_call
+    assert "MUST be exact names from the prior" in relations_call
+
+
+def test_api_key_redacted_from_exception_warning():
+    """A thrown exception whose message echoes the api_key is redacted in warnings."""
+    sections = split_sections(_MD)
+    secret = "sk-SECRET-REDACT-ME-1234567890"
+
+    class _Boom(Exception):
+        pass
+
+    responses = [
+        _Boom(f"request failed with key {secret}"),
+        '{"concepts": []}',
+        '{"entities": []}',
+        '{"relations": []}',
+    ]
+    it = iter(responses)
+
+    def fake_json(system: str, user: str) -> str:
+        item = next(it)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    client = LLMClient(LLMConfig(base_url="https://x/v1", model="m", api_key=secret))
+    with patch.object(LLMClient, "json_completion", side_effect=fake_json):
+        out = extract(client, _MD, sections, language="en", max_concepts=12, max_entities=12)
+
+    # the summary failed -> a warning was recorded; the secret must be gone
+    joined = "\n".join(out.warnings)
+    assert secret not in joined, f"api_key leaked into warnings: {joined}"
+    assert "[REDACTED]" in joined

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from openkb.okf.schema import (
     Extracts,
     ProposedEdge,
     SectionSpec,
+    validate_evidence,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,37 @@ ENV_API_KEY = "OPENKB_LLM_API_KEY"
 ENV_TIMEOUT = "OPENKB_LLM_TIMEOUT"
 
 _DEFAULT_TIMEOUT = 120.0
+
+
+# Redaction patterns. ``redact_secrets`` is applied to every string that might
+# reach a persisted surface (manifest warnings, batch_report errors, log.md,
+# CLI output) so an exception carrying a key/token never leaks out.
+_SK_PATTERN = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
+_BEARER_PATTERN = re.compile(
+    r"(Authorization|Bearer)\s*[:=]?\s*[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE
+)
+_REDACTED = "[REDACTED]"
+
+
+def redact_secrets(text: str, api_key: str | None = None) -> str:
+    """Strip secret-looking substrings from ``text``.
+
+    Redacts, in order: the exact ``api_key`` value (when given), ``sk-...``
+    token patterns, and ``Authorization``/``Bearer`` header values. Never
+    raises - returns the input unchanged on any error. Idempotent on already
+    redacted text (``[REDACTED]`` contains no ``sk-`` prefix).
+    """
+    if not isinstance(text, str):
+        return text
+    try:
+        out = text
+        if api_key and api_key.strip():
+            out = out.replace(api_key, _REDACTED)
+        out = _SK_PATTERN.sub(_REDACTED, out)
+        out = _BEARER_PATTERN.sub(lambda m: m.group(1) + ": " + _REDACTED, out)
+        return out
+    except Exception:  # noqa: BLE001 - redaction must never raise
+        return out
 
 
 @dataclass
@@ -184,6 +217,11 @@ class LLMClient:
         # Normalize once; record the normalized model for the manifest.
         self.model = normalize_model(config.model, config.base_url)
 
+    @property
+    def api_key(self) -> str | None:
+        """The configured api_key (read-only; used only for redaction in warnings)."""
+        return self._config.api_key
+
     def json_completion(self, system: str, user: str) -> str:
         """Make one JSON-mode completion; return the raw content string.
 
@@ -234,15 +272,27 @@ def extract(
 ) -> Extracts:
     """Run the four extracts sequentially and return validated :class:`Extracts`.
 
-    Order: summary -> concepts -> entities -> relations. Each is awaited
-    before the next (single in-flight call). Any call that fails or yields
-    no valid items records a warning and the extract continues - a broken
-    concept call must not prevent the summary from being written.
+    Order: summary -> concepts -> entities -> relations, with each step's
+    output threaded forward (concepts see the summary; entities see summary +
+    concepts; relations see summary + concepts + entities and must pick
+    subject/object from those names rather than re-inferring them).
 
-    Evidence-less concepts/entities/relations are dropped (with a warning).
+    Each call is awaited before the next (single in-flight call). Any call that
+    fails or yields no valid items records a warning and the extract continues -
+    a broken concept call must not prevent the summary from being written.
+
+    Evidence is validated against the section map (heading_path must match a
+    known section and the line range must fall within it); invalid extracts are
+    dropped with a warning. Secrets are redacted from every warning string so a
+    thrown exception can never leak the api_key into the manifest.
     """
     out = Extracts()
     warnings = out.warnings
+    total_lines = max(markdown.count("\n") + 1, 1)
+    api_key = client.api_key if hasattr(client, "api_key") else None
+
+    def _record_warning(msg: str) -> None:
+        warnings.append(redact_secrets(msg, api_key))
 
     # 1. Summary (whole-article, no evidence required).
     try:
@@ -251,33 +301,46 @@ def extract(
         summary = _parse_summary(raw)
         out.summary = summary or ""
         if not out.summary:
-            warnings.append("summary: model returned empty summary")
+            _record_warning("summary: model returned empty summary")
     except Exception as exc:  # noqa: BLE001 - surface as a warning, keep going
-        warnings.append(f"summary: extraction failed ({_err(exc)})")
+        _record_warning(f"summary: extraction failed ({_err(exc)})")
 
-    # 2. Concepts (local, evidence-required).
+    # 2. Concepts (local, evidence-required) - receive the summary.
     try:
-        sys_msg, user_msg = concepts_messages(markdown, sections, max_concepts)
+        sys_msg, user_msg = concepts_messages(markdown, sections, max_concepts, summary=out.summary)
         raw = client.json_completion(sys_msg, user_msg)
-        out.concepts = _parse_concepts(raw, warnings)
+        out.concepts = _parse_concepts(raw, warnings, sections, total_lines)
     except Exception as exc:  # noqa: BLE001
-        warnings.append(f"concepts: extraction failed ({_err(exc)})")
+        _record_warning(f"concepts: extraction failed ({_err(exc)})")
 
-    # 3. Entities (local, evidence-required).
+    # 3. Entities (local, evidence-required) - receive summary + concepts.
     try:
-        sys_msg, user_msg = entities_messages(markdown, sections, max_entities)
+        sys_msg, user_msg = entities_messages(
+            markdown,
+            sections,
+            max_entities,
+            summary=out.summary,
+            concepts=out.concepts,
+        )
         raw = client.json_completion(sys_msg, user_msg)
-        out.entities = _parse_entities(raw, warnings)
+        out.entities = _parse_entities(raw, warnings, sections, total_lines)
     except Exception as exc:  # noqa: BLE001
-        warnings.append(f"entities: extraction failed ({_err(exc)})")
+        _record_warning(f"entities: extraction failed ({_err(exc)})")
 
-    # 4. Relations (proposed-only, evidence-required).
+    # 4. Relations (proposed-only, evidence-required) - receive summary +
+    #    concepts + entities; subject/object must come from those names.
     try:
-        sys_msg, user_msg = relations_messages(markdown, sections)
+        sys_msg, user_msg = relations_messages(
+            markdown,
+            sections,
+            summary=out.summary,
+            concepts=out.concepts,
+            entities=out.entities,
+        )
         raw = client.json_completion(sys_msg, user_msg)
-        out.relations = _parse_relations(raw, warnings)
+        out.relations = _parse_relations(raw, warnings, sections, total_lines)
     except Exception as exc:  # noqa: BLE001
-        warnings.append(f"relations: extraction failed ({_err(exc)})")
+        _record_warning(f"relations: extraction failed ({_err(exc)})")
 
     return out
 
@@ -292,19 +355,19 @@ def _parse_summary(raw: str) -> str:
     return ""
 
 
-def _parse_concepts(raw: str, warnings: list[str]) -> list[ConceptExtract]:
+def _parse_concepts(raw, warnings, sections, total_lines):
     items = _extract_items(raw, "concepts")
-    return _filter_with_evidence(items, "concept", warnings, _to_concept)
+    return _filter_with_evidence(items, "concept", warnings, _to_concept, sections, total_lines)
 
 
-def _parse_entities(raw: str, warnings: list[str]) -> list[EntityExtract]:
+def _parse_entities(raw, warnings, sections, total_lines):
     items = _extract_items(raw, "entities")
-    return _filter_with_evidence(items, "entity", warnings, _to_entity)
+    return _filter_with_evidence(items, "entity", warnings, _to_entity, sections, total_lines)
 
 
-def _parse_relations(raw: str, warnings: list[str]) -> list[ProposedEdge]:
+def _parse_relations(raw, warnings, sections, total_lines):
     items = _extract_items(raw, "relations")
-    return _filter_with_evidence(items, "relation", warnings, _to_edge)
+    return _filter_with_evidence(items, "relation", warnings, _to_edge, sections, total_lines)
 
 
 def _extract_items(raw: str, key: str) -> list[dict]:
@@ -317,23 +380,42 @@ def _extract_items(raw: str, key: str) -> list[dict]:
     return []
 
 
-def _filter_with_evidence(items, label, warnings, converter):
-    """Keep items whose ``converter`` yields a valid (evidence-carrying) extract.
+def _filter_with_evidence(items, label, warnings, converter, sections, total_lines):
+    """Keep items whose evidence validates against the section map.
 
     Drops the rest with a single aggregated warning so a noisy model doesn't
-    flood the manifest. ``converter`` returns ``None`` for a bad item.
+    flood the manifest. ``converter`` returns ``None`` for a structurally bad
+    item; an item with structurally-valid but section-mismatched evidence is
+    also dropped (counted in the same warning).
     """
     kept = []
     dropped = 0
     for it in items:
         ext = converter(it)
-        if ext is not None and ext.is_valid():
-            kept.append(ext)
-        else:
+        if ext is None or not validate_evidence(ext.evidence, sections, total_lines):
             dropped += 1
+            continue
+        kept.append(ext)
     if dropped:
-        warnings.append(f"{label}: dropped {dropped} item(s) with missing/invalid evidence")
+        warnings.append(
+            f"{label}: dropped {dropped} item(s) with missing/invalid/out-of-range evidence"
+        )
     return kept
+
+
+def _confidence(obj: dict) -> float | None:
+    """Coerce an LLM ``confidence`` value to a 0-1 float, or ``None``."""
+    c = obj.get("confidence")
+    if isinstance(c, bool):  # bool is an int subclass; reject it
+        return None
+    if isinstance(c, (int, float)):
+        try:
+            v = float(c)
+        except (TypeError, ValueError):
+            return None
+        if 0.0 <= v <= 1.0:
+            return v
+    return None
 
 
 def _to_concept(obj: dict) -> ConceptExtract | None:
@@ -345,6 +427,7 @@ def _to_concept(obj: dict) -> ConceptExtract | None:
         name=name.strip(),
         description=desc.strip() if isinstance(desc, str) else "",
         evidence=_evidence_from(obj),
+        confidence=_confidence(obj),
     )
 
 
@@ -367,6 +450,7 @@ def _to_entity(obj: dict) -> EntityExtract | None:
         description=desc.strip() if isinstance(desc, str) else "",
         aliases=al,
         evidence=_evidence_from(obj),
+        confidence=_confidence(obj),
     )
 
 

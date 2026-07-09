@@ -186,3 +186,136 @@ def test_zips_are_independent_no_shared_context(tmp_path):
         beta_article = zf.read("sources/article.md").decode()
     assert "Alpha" in alpha_article and "Beta" not in alpha_article
     assert "Beta" in beta_article and "Alpha" not in beta_article
+
+
+def test_markdown_extension_discovered_by_default(tmp_path):
+    """flat mode with the default *.md glob must also pick up .markdown files."""
+    indir = tmp_path / "in"
+    indir.mkdir()
+    _make_md(indir / "a.md", "A")
+    (indir / "b.markdown").write_text("# B\n\n## S\n\nbody\n", encoding="utf-8")
+    outdir = tmp_path / "out"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["okf", "compile-dir", str(indir), "--out", str(outdir), "--no-llm", "--mode", "flat"]
+    )
+    assert result.exit_code == 0, result.output
+    assert (outdir / "a.okf.zip").exists()
+    assert (outdir / "b.okf.zip").exists()
+
+
+def test_wechat_ambiguous_dir_skipped_not_guessed(tmp_path):
+    """A wechat dir with multiple .md and no dir-stem match is skipped, not guessed."""
+    indir = tmp_path / "in"
+    indir.mkdir()
+    # clean dir: one md matching the dir name -> selected
+    d1 = indir / "art1"
+    d1.mkdir()
+    _make_md(d1 / "art1.md", "Art1")
+    (d1 / "assets").mkdir()
+    # ambiguous dir: two md, neither matches dir name
+    d2 = indir / "ambiguous"
+    d2.mkdir()
+    (d2 / "a.md").write_text("# A\n\n## S\n\nx\n", encoding="utf-8")
+    (d2 / "b.md").write_text("# B\n\n## S\n\nx\n", encoding="utf-8")
+    outdir = tmp_path / "out"
+    report = tmp_path / "report.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "okf",
+            "compile-dir",
+            str(indir),
+            "--out",
+            str(outdir),
+            "--no-llm",
+            "--mode",
+            "wechat",
+            "--report",
+            str(report),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # the clean dir compiled; the ambiguous dir was skipped (no zip for it)
+    assert (outdir / "art1.okf.zip").exists()
+    data = json.loads(report.read_text(encoding="utf-8"))
+    skip = [r for r in data["results"] if r["status"] == "skipped"]
+    assert any(r["input"].endswith("ambiguous") for r in skip), skip
+
+
+def test_batch_report_no_absolute_paths(tmp_path):
+    """batch_report.json input/output paths are relative to input/out dirs."""
+    indir = tmp_path / "in"
+    indir.mkdir()
+    _make_md(indir / "a.md", "A")
+    outdir = tmp_path / "out"
+    report = tmp_path / "report.json"
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        [
+            "okf",
+            "compile-dir",
+            str(indir),
+            "--out",
+            str(outdir),
+            "--no-llm",
+            "--report",
+            str(report),
+        ],
+    )
+    data = json.loads(report.read_text(encoding="utf-8"))
+    for r in data["results"]:
+        # relative -> no drive letter, no leading slash
+        assert ":" not in r["input"], r
+        assert not r["input"].startswith("/"), r
+        assert r["output"] is None or (":" not in r["output"]), r
+
+
+def test_exception_with_api_key_redacted_from_report(tmp_path, monkeypatch):
+    """An LLM error echoing the api_key must be redacted in the batch report.
+
+    Patches ``compile_one`` to raise an exception whose message carries the
+    api_key, so the test is deterministic (no real network call) and fast.
+    The redaction gate in ``compile_one``'s except clause must strip the key
+    from the recorded error before it reaches ``batch_report.json``.
+    """
+    import openkb.okf.compiler as okf_compiler
+
+    secret = "sk-SECRET-XYZ-9876543210"
+
+    def _boom(input_md, out, opts):
+        raise RuntimeError(f"auth failed for key {secret}")
+
+    monkeypatch.setattr(okf_compiler, "compile_one", _boom)
+
+    indir = tmp_path / "in"
+    indir.mkdir()
+    _make_md(indir / "a.md", "A")
+    outdir = tmp_path / "out"
+    report = tmp_path / "report.json"
+    runner = CliRunner()
+    # Pass the secret as the api_key so the redaction gate has it to strip.
+    runner.invoke(
+        cli,
+        [
+            "okf",
+            "compile-dir",
+            str(indir),
+            "--out",
+            str(outdir),
+            "--api-key",
+            secret,
+            "--model",
+            "m",
+            "--report",
+            str(report),
+        ],
+    )
+    data = json.loads(report.read_text(encoding="utf-8"))
+    blob = json.dumps(data)
+    assert secret not in blob, f"api_key leaked into batch report: {blob}"
+    # the failed result recorded an error (redacted)
+    failed = [r for r in data["results"] if r["status"] == "failed"]
+    assert failed, data

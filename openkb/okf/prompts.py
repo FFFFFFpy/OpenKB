@@ -15,7 +15,7 @@ whether to accept them); nothing here materializes a backlink in the body.
 
 from __future__ import annotations
 
-from openkb.okf.schema import SectionSpec
+from openkb.okf.schema import ConceptExtract, EntityExtract, SectionSpec
 
 _SYSTEM = """\
 You are the extraction agent for an OKF Bundle: a self-contained, per-article \
@@ -53,6 +53,42 @@ def _user_body(markdown: str, sections: list[SectionSpec], task: str) -> str:
     )
 
 
+def _compact_concepts(concepts: list[ConceptExtract]) -> str:
+    """One-line-per-concept compact view for downstream prompts.
+
+    Carries the name and a trimmed description so the relations prompt can pick
+    subject/object from the actual extracted names instead of re-inferring them.
+    """
+    if not concepts:
+        return "(no concepts extracted yet)"
+    lines = ["Prior extracted concepts (reuse these names, do not invent new ones):"]
+    for c in concepts:
+        desc = (c.description or "").strip().replace("\n", " ")
+        if len(desc) > 80:
+            desc = desc[:77] + "..."
+        lines.append(f"- {c.name}: {desc}")
+    return "\n".join(lines)
+
+
+def _compact_entities(entities: list[EntityExtract]) -> str:
+    """One-line-per-entity compact view for downstream prompts."""
+    if not entities:
+        return "(no entities extracted yet)"
+    lines = ["Prior extracted entities (reuse these names, do not invent new ones):"]
+    for e in entities:
+        desc = (e.description or "").strip().replace("\n", " ")
+        if len(desc) > 80:
+            desc = desc[:77] + "..."
+        al = f" (aliases: {', '.join(e.aliases)})" if e.aliases else ""
+        lines.append(f"- {e.name} [{e.entity_type}]: {desc}{al}")
+    return "\n".join(lines)
+
+
+def _prior_summary(summary: str) -> str:
+    s = (summary or "").strip()
+    return f"Prior summary of this article (use it, do not contradict it):\n{s}" if s else ""
+
+
 def summary_messages(markdown: str, sections: list[SectionSpec], language: str) -> tuple[str, str]:
     """Build the (system, user) messages for the summary extract."""
     lang = language.strip() or "en"
@@ -66,15 +102,24 @@ def summary_messages(markdown: str, sections: list[SectionSpec], language: str) 
 
 
 def concepts_messages(
-    markdown: str, sections: list[SectionSpec], max_concepts: int
+    markdown: str,
+    sections: list[SectionSpec],
+    max_concepts: int,
+    *,
+    summary: str = "",
 ) -> tuple[str, str]:
-    """Build the (system, user) messages for the local-concepts extract."""
+    """Build the (system, user) messages for the local-concepts extract.
+
+    Receives the prior ``summary`` so concept extraction stays consistent with
+    it rather than re-reading the article blind.
+    """
     task = (
         f"Extract up to {max_concepts} key CONCEPTS from this article. Return a JSON object:\n"
         '{\n  "concepts": [\n'
         "    {\n"
         '      "name": "<concept name>",\n'
         '      "description": "<one or two sentences>",\n'
+        '      "confidence": <0.0-1.0>,\n'
         '      "evidence": {"heading_path": "<section>", '
         '"line_start": <int>, "line_end": <int>}\n'
         "    }\n  ]\n"
@@ -82,13 +127,24 @@ def concepts_messages(
         "These are LOCAL concepts for this article only - not global wiki pages. "
         "Each concept MUST have a valid evidence object. Return only the JSON object."
     )
-    return _SYSTEM, _user_body(markdown, sections, task)
+    prior = _prior_summary(summary)
+    full = f"{task}\n\n{prior}" if prior else task
+    return _SYSTEM, _user_body(markdown, sections, full)
 
 
 def entities_messages(
-    markdown: str, sections: list[SectionSpec], max_entities: int
+    markdown: str,
+    sections: list[SectionSpec],
+    max_entities: int,
+    *,
+    summary: str = "",
+    concepts: list[ConceptExtract] | None = None,
 ) -> tuple[str, str]:
-    """Build the (system, user) messages for the local-entities extract."""
+    """Build the (system, user) messages for the local-entities extract.
+
+    Receives the prior ``summary`` and the compact ``concepts`` list so entity
+    extraction aligns with what was already extracted.
+    """
     task = (
         f"Extract up to {max_entities} named ENTITIES from this article. Return a JSON object:\n"
         '{\n  "entities": [\n'
@@ -97,6 +153,7 @@ def entities_messages(
         '      "type": "person|organization|place|product|work|event|other",\n'
         '      "description": "<one sentence>",\n'
         '      "aliases": ["<alt name>", ...],\n'
+        '      "confidence": <0.0-1.0>,\n'
         '      "evidence": {"heading_path": "<section>", '
         '"line_start": <int>, "line_end": <int>}\n'
         "    }\n  ]\n"
@@ -104,26 +161,56 @@ def entities_messages(
         "These are LOCAL entities for this article only. Each entity MUST have a valid "
         "evidence object. Return only the JSON object."
     )
-    return _SYSTEM, _user_body(markdown, sections, task)
+    parts = [task]
+    prior = _prior_summary(summary)
+    if prior:
+        parts.append(prior)
+    if concepts:
+        parts.append(_compact_concepts(concepts))
+    full = "\n\n".join(parts)
+    return _SYSTEM, _user_body(markdown, sections, full)
 
 
-def relations_messages(markdown: str, sections: list[SectionSpec]) -> tuple[str, str]:
-    """Build the (system, user) messages for the proposed-relations extract."""
+def relations_messages(
+    markdown: str,
+    sections: list[SectionSpec],
+    *,
+    summary: str = "",
+    concepts: list[ConceptExtract] | None = None,
+    entities: list[EntityExtract] | None = None,
+) -> tuple[str, str]:
+    """Build the (system, user) messages for the proposed-relations extract.
+
+    Receives the prior ``summary`` + compact ``concepts`` + compact ``entities``.
+    The prompt forbids inventing new node names: subject/object MUST be chosen
+    from the supplied concept/entity names.
+    """
     task = (
-        "Propose relations BETWEEN the concepts and entities of THIS article. "
+        "Propose relations BETWEEN the concepts and entities extracted above. "
         "Return a JSON object:\n"
         '{\n  "relations": [\n'
         "    {\n"
-        '      "subject": "<name>",\n'
+        '      "subject": "<one of the names listed above>",\n'
         '      "relation": "<relation type>",\n'
-        '      "object": "<name>",\n'
+        '      "object": "<one of the names listed above>",\n'
         '      "evidence": {"heading_path": "<section>", '
         '"line_start": <int>, "line_end": <int>},\n'
         '      "note": "<optional short note>"\n'
         "    }\n  ]\n"
         "}\n"
-        "Subject/object must name concepts or entities that appear in this article. "
-        "These are PROPOSED edges only - do not modify the article body. "
-        "Each relation MUST have a valid evidence object. Return only the JSON object."
+        "CRITICAL: subject and object MUST be exact names from the prior "
+        "concepts/entities lists. Do NOT invent new names. If no relations "
+        "exist, return an empty list. These are PROPOSED edges only - do not "
+        "modify the article body. Each relation MUST have a valid evidence "
+        "object. Return only the JSON object."
     )
-    return _SYSTEM, _user_body(markdown, sections, task)
+    parts = [task]
+    prior = _prior_summary(summary)
+    if prior:
+        parts.append(prior)
+    if concepts:
+        parts.append(_compact_concepts(concepts))
+    if entities:
+        parts.append(_compact_entities(entities))
+    full = "\n\n".join(parts)
+    return _SYSTEM, _user_body(markdown, sections, full)

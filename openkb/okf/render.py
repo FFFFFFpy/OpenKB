@@ -18,6 +18,7 @@ from pathlib import Path
 
 from openkb import frontmatter
 from openkb.locks import atomic_write_json, atomic_write_text
+from openkb.okf.llm import redact_secrets
 from openkb.okf.schema import (
     ARTICLE_MD,
     ASSETS_DIR,
@@ -61,7 +62,7 @@ def render_bundle(
     sections: list[SectionSpec],
     image_refs: list[ImageRef],
     extracts: Extracts,
-    source_path: str,
+    original_filename: str,
     title: str | None,
     language: str,
     llm_enabled: bool,
@@ -74,10 +75,14 @@ def render_bundle(
     populated by :mod:`openkb.okf.assets` (the actual byte copy happens there
     because it needs the source files); this function only writes text/JSON.
 
+    ``original_filename`` is the input Markdown's basename (e.g.
+    ``article.md``); it is recorded in the manifest so consumers know the
+    source filename without an absolute local path leaking in.
+
     Returns the ``manifest.json`` dict (also written to disk) so the caller
     can include it in a batch report without re-parsing.
     """
-    _safe_title = (title or _stem_from(source_path) or "untitled").strip() or "untitled"
+    _safe_title = (title or _stem_from(original_filename) or "untitled").strip() or "untitled"
     _ensure_dirs(workdir)
 
     # --- okf.yaml ---
@@ -92,8 +97,8 @@ def render_bundle(
 
     # --- extracts/ ---
     _write_summary(workdir, extracts, _safe_title)
-    _write_concepts(workdir, extracts.concepts)
-    _write_entities(workdir, extracts.entities)
+    _write_concepts(workdir, extracts.concepts, sections)
+    _write_entities(workdir, extracts.entities, sections)
     # extracts/claims/ is reserved (empty in v1); create the dir so consumers
     # see the expected tree even with no claims.
     (workdir / CLAIMS_DIR).mkdir(parents=True, exist_ok=True)
@@ -101,8 +106,8 @@ def render_bundle(
     # --- relations/proposed_edges.jsonl ---
     _write_relations(workdir, extracts.relations)
 
-    # --- source_map.json ---
-    source_map = _build_source_map(sections, image_refs)
+    # --- source_map.json (sections + images + all extract evidence) ---
+    source_map = _build_source_map(sections, image_refs, extracts)
     atomic_write_json(workdir / SOURCE_MAP_JSON, source_map)
 
     # --- index.md + log.md ---
@@ -129,7 +134,12 @@ def render_bundle(
         "language": language or "en",
         "created_at": _now_iso(),
         "counts": counts,
-        "inputs": {"source": source_path, "markdown_bytes": len(markdown.encode("utf-8"))},
+        # Portable inputs: a filename + byte count, never an absolute path.
+        "inputs": {
+            "source_md": ARTICLE_MD,
+            "original_filename": original_filename,
+            "markdown_bytes": len(markdown.encode("utf-8")),
+        },
         "compiler": manifest_compiler_block(llm_enabled=llm_enabled, model=model),
         "warnings": list(warnings) + list(extracts.warnings),
     }
@@ -166,33 +176,56 @@ def _write_section(workdir: Path, sec: SectionSpec) -> None:
 
 
 def _write_summary(workdir: Path, extracts: Extracts, title: str) -> None:
+    """Write ``extracts/summary.md`` with a Document-Summary frontmatter.
+
+    Frontmatter carries ``type``/``title``/``source`` so a consumer can identify
+    the file without parsing the body. The summary itself is whole-article, so
+    no line evidence is attached.
+    """
     body = extracts.summary.strip() if extracts.summary else "_(no summary available)_"
-    content = f"# {title}\n\n{body}\n"
-    atomic_write_text(workdir / SUMMARY_MD, content)
+    # extracts/summary.md is one level deep, so the source link climbs one dir.
+    lines = [
+        frontmatter.kv_line("type", "Document Summary"),
+        frontmatter.kv_line("title", title),
+        frontmatter.kv_line("source", "../" + ARTICLE_MD),
+    ]
+    atomic_write_text(workdir / SUMMARY_MD, frontmatter.block(lines) + f"{body}\n")
 
 
-def _write_concepts(workdir: Path, concepts: list[ConceptExtract]) -> None:
+def _write_concepts(
+    workdir: Path, concepts: list[ConceptExtract], sections: list[SectionSpec]
+) -> None:
+    # extracts/concepts/*.md is two levels deep, so the source link climbs two dirs.
+    concept_source = "../../" + ARTICLE_MD
     for c in concepts:
         slug = _slugify(c.name) or "concept"
         lines = [
-            frontmatter.kv_line("type", "Concept"),
-            frontmatter.kv_line("name", c.name),
+            frontmatter.kv_line("type", "Local Concept"),
+            frontmatter.kv_line("title", c.name),
+            frontmatter.kv_line("source", concept_source),
             frontmatter.kv_line("scope", "local"),
             frontmatter.kv_line("heading_path", c.evidence.heading_path if c.evidence else ""),
             f"line_start: {c.evidence.line_start if c.evidence else 0}",
             f"line_end: {c.evidence.line_end if c.evidence else 0}",
         ]
+        if c.confidence is not None:
+            lines.append(f"confidence: {c.confidence}")
         body = c.description or ""
         content = frontmatter.block(lines) + f"{body}\n" if body else frontmatter.block(lines)
         atomic_write_text(workdir / CONCEPTS_DIR / f"{slug}.md", content)
 
 
-def _write_entities(workdir: Path, entities: list[EntityExtract]) -> None:
+def _write_entities(
+    workdir: Path, entities: list[EntityExtract], sections: list[SectionSpec]
+) -> None:
+    # extracts/entities/*.md is two levels deep, so the source link climbs two dirs.
+    entity_source = "../../" + ARTICLE_MD
     for e in entities:
         slug = _slugify(e.name) or "entity"
         lines = [
-            frontmatter.kv_line("type", _capitalize(e.entity_type)),
-            frontmatter.kv_line("name", e.name),
+            frontmatter.kv_line("type", f"Local {_capitalize(e.entity_type)}"),
+            frontmatter.kv_line("title", e.name),
+            frontmatter.kv_line("source", entity_source),
             frontmatter.kv_line("scope", "local"),
             frontmatter.list_line("aliases", e.aliases)
             if e.aliases
@@ -201,6 +234,8 @@ def _write_entities(workdir: Path, entities: list[EntityExtract]) -> None:
             f"line_start: {e.evidence.line_start if e.evidence else 0}",
             f"line_end: {e.evidence.line_end if e.evidence else 0}",
         ]
+        if e.confidence is not None:
+            lines.append(f"confidence: {e.confidence}")
         body = e.description or ""
         content = frontmatter.block(lines) + f"{body}\n" if body else frontmatter.block(lines)
         atomic_write_text(workdir / ENTITIES_DIR / f"{slug}.md", content)
@@ -234,12 +269,24 @@ def _write_relations(workdir: Path, relations: list[ProposedEdge]) -> None:
     atomic_write_text(path, "\n".join(lines) + "\n")
 
 
-def _build_source_map(sections: list[SectionSpec], image_refs: list[ImageRef]) -> dict:
-    """Map each section file and each image to its source provenance."""
+def _build_source_map(
+    sections: list[SectionSpec],
+    image_refs: list[ImageRef],
+    extracts: Extracts,
+) -> dict:
+    """Map every emitted artifact back to its provenance in ``sources/article.md``.
+
+    Sections and images map to their spans/refs; each LLM extract
+    (summary/concepts/entities/relations) carries its evidence so a consumer
+    can trace any claim back to a section + line range of the source article.
+    """
+    article = ARTICLE_MD
     return {
+        "article": {"file": article, "sections": len(sections)},
         "sections": [
             {
                 "file": sec.filename,
+                "source": article,
                 "title": sec.title,
                 "heading_path": sec.heading_path,
                 "line_start": sec.line_start,
@@ -250,10 +297,52 @@ def _build_source_map(sections: list[SectionSpec], image_refs: list[ImageRef]) -
         "images": [
             {
                 "dest": f"{IMAGES_DIR}/{r.dest_name}" if r.found else None,
+                "source": article if r.found else None,
                 "original_ref": r.original_ref,
                 "found": r.found,
             }
             for r in image_refs
+        ],
+        "summary": {
+            "file": SUMMARY_MD,
+            "source": article,
+            # whole-article; no line range
+        },
+        "concepts": [
+            {
+                "file": f"{CONCEPTS_DIR}/{_slugify(c.name)}.md",
+                "source": article,
+                "name": c.name,
+                "heading_path": c.evidence.heading_path if c.evidence else "",
+                "line_start": c.evidence.line_start if c.evidence else 0,
+                "line_end": c.evidence.line_end if c.evidence else 0,
+            }
+            for c in extracts.concepts
+        ],
+        "entities": [
+            {
+                "file": f"{ENTITIES_DIR}/{_slugify(e.name)}.md",
+                "source": article,
+                "name": e.name,
+                "type": e.entity_type,
+                "heading_path": e.evidence.heading_path if e.evidence else "",
+                "line_start": e.evidence.line_start if e.evidence else 0,
+                "line_end": e.evidence.line_end if e.evidence else 0,
+            }
+            for e in extracts.entities
+        ],
+        "relations": [
+            {
+                "file": PROPOSED_EDGES_JSONL,
+                "source": article,
+                "subject": r.subject,
+                "relation": r.relation,
+                "object": r.object,
+                "heading_path": r.evidence.heading_path if r.evidence else "",
+                "line_start": r.evidence.line_start if r.evidence else 0,
+                "line_end": r.evidence.line_end if r.evidence else 0,
+            }
+            for r in extracts.relations
         ],
     }
 
@@ -289,7 +378,8 @@ def _log_md(title: str, llm_enabled: bool, warnings: list[str]) -> str:
         lines.append("")
         lines.append("Warnings:")
         for w in warnings:
-            lines.append(f"- {w}")
+            # Redact in case a thrown exception carried a key/token into a warning.
+            lines.append(f"- {redact_secrets(w)}")
     return "\n".join(lines) + "\n"
 
 

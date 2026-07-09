@@ -15,7 +15,13 @@ from pathlib import Path
 from openkb.okf.bundle import write_zip
 from openkb.okf.markdown import split_sections
 from openkb.okf.render import render_bundle
-from openkb.okf.schema import Extracts
+from openkb.okf.schema import (
+    ConceptExtract,
+    EntityExtract,
+    Evidence,
+    Extracts,
+    ProposedEdge,
+)
 
 _MD = "# My Article\n\n## Section A\n\nBody.\n\n## Section B\n\nMore.\n"
 
@@ -28,9 +34,9 @@ def _build_zip(tmp_path: Path, *, llm_enabled: bool = False, model: str | None =
         sections=split_sections(_MD),
         image_refs=[],
         extracts=Extracts(),
-        source_path="article.md",
+        original_filename="article.md",
         title="My Article",
-        language="en",
+        language="zh",
         llm_enabled=llm_enabled,
         model=model,
         warnings=[],
@@ -113,6 +119,14 @@ def test_manifest_required_fields(tmp_path):
     assert compiler["model"] == "openai/gpt-4o"
     # api_key must NEVER appear in the compiler block
     assert "api_key" not in compiler
+    # bundle_type aligned with kind (markdown_article, not single-article)
+    assert manifest["bundle_type"] == "markdown_article"
+    # inputs must be portable (no absolute local path)
+    inputs = manifest["inputs"]
+    assert inputs["source_md"] == "sources/article.md"
+    assert inputs["original_filename"] == "article.md"
+    assert isinstance(inputs["markdown_bytes"], int)
+    assert "source" not in inputs  # old absolute-path field removed
     counts = manifest["counts"]
     for key in ("sections", "concepts", "entities", "relations", "images", "missing_assets"):
         assert key in counts, key
@@ -138,9 +152,9 @@ def test_api_key_absent_from_zip_contents(tmp_path):
         sections=split_sections(_MD),
         image_refs=[],
         extracts=Extracts(summary="A clean summary."),
-        source_path="article.md",
+        original_filename="article.md",
         title="My Article",
-        language="en",
+        language="zh",
         llm_enabled=True,
         model="openai/gpt-4o",
         warnings=[],
@@ -186,3 +200,83 @@ def test_forbidden_path_raises(tmp_path):
         raise AssertionError("expected ValueError for forbidden raw/ path")
     except ValueError as exc:
         assert "raw" in str(exc).lower() or "mhtml" in str(exc).lower()
+
+
+def _extracts_with_evidence() -> Extracts:
+    ev = Evidence(heading_path="Section A", line_start=3, line_end=4)
+    return Extracts(
+        summary="A summary.",
+        concepts=[ConceptExtract(name="ConceptA", description="d", evidence=ev, confidence=0.9)],
+        entities=[EntityExtract(name="EntityA", entity_type="org", description="d", evidence=ev)],
+        relations=[
+            ProposedEdge(subject="ConceptA", relation="mentions", object="EntityA", evidence=ev)
+        ],
+    )
+
+
+def test_source_map_contains_extract_evidence(tmp_path):
+    """source_map.json must map each extract back to sources/article.md + evidence."""
+    workdir = tmp_path / "wd"
+    render_bundle(
+        workdir,
+        markdown=_MD,
+        sections=split_sections(_MD),
+        image_refs=[],
+        extracts=_extracts_with_evidence(),
+        original_filename="article.md",
+        title="My Article",
+        language="zh",
+        llm_enabled=True,
+        model="openai/gpt-4o",
+        warnings=[],
+    )
+    sm = json.loads((workdir / "source_map.json").read_text(encoding="utf-8"))
+    # every extract category is present and points at the article source
+    assert sm["summary"]["source"] == "sources/article.md"
+    assert sm["concepts"] and sm["concepts"][0]["source"] == "sources/article.md"
+    assert sm["concepts"][0]["name"] == "ConceptA"
+    assert sm["concepts"][0]["heading_path"] == "Section A"
+    assert sm["entities"] and sm["entities"][0]["source"] == "sources/article.md"
+    assert sm["entities"][0]["name"] == "EntityA"
+    assert sm["relations"] and sm["relations"][0]["source"] == "sources/article.md"
+    assert sm["relations"][0]["subject"] == "ConceptA"
+    assert sm["relations"][0]["object"] == "EntityA"
+
+
+def test_summary_and_concept_frontmatter(tmp_path):
+    """summary.md has Document-Summary frontmatter; concepts are Local Concept."""
+    workdir = tmp_path / "wd"
+    render_bundle(
+        workdir,
+        markdown=_MD,
+        sections=split_sections(_MD),
+        image_refs=[],
+        extracts=_extracts_with_evidence(),
+        original_filename="article.md",
+        title="My Article",
+        language="zh",
+        llm_enabled=True,
+        model="openai/gpt-4o",
+        warnings=[],
+    )
+    summary = (workdir / "extracts" / "summary.md").read_text(encoding="utf-8")
+    assert 'type: "Document Summary"' in summary
+    assert 'source: "../sources/article.md"' in summary
+    concept = (workdir / "extracts" / "concepts" / "concepta.md").read_text(encoding="utf-8")
+    assert 'type: "Local Concept"' in concept
+    assert 'source: "../../sources/article.md"' in concept
+    assert "confidence: 0.9" in concept
+
+
+def test_no_absolute_paths_in_zip_text_files(tmp_path):
+    """No drive-letter or rooted absolute path in any zip text file."""
+    import re
+
+    out = _build_zip(tmp_path, llm_enabled=True, model="openai/gpt-4o")
+    abs_re = re.compile(r"[A-Za-z]:[\\/]|^/")
+    with zipfile.ZipFile(out) as zf:
+        for name in zf.namelist():
+            if name.endswith("/"):
+                continue
+            data = zf.read(name).decode("utf-8", errors="replace")
+            assert not abs_re.search(data), f"absolute path in {name}"

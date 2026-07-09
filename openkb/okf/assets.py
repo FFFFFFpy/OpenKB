@@ -62,10 +62,11 @@ def collect_images(
         missing image (and per escaped path).
     """
     warnings: list[str] = []
-    # source-resolved-path -> dest filename, so the same image referenced
+    # normalized-relative-path -> dest filename, so the same image referenced
     # twice (across sections or within one) is copied once and both links
-    # resolve to the same dest.
-    assigned: dict[Path, str] = {}
+    # resolve to the same dest. Keyed on the *relative* path (not the absolute
+    # resolved path) so a dest name is stable when the input directory moves.
+    assigned: dict[str, str] = {}
     # dest filenames already claimed, so two sources sharing a basename
     # don't clobber each other.
     taken: set[str] = set()
@@ -76,6 +77,7 @@ def collect_images(
         rewritten = body
         for match in _RELATIVE_RE.finditer(body):
             alt, rel_path = match.group(1), match.group(2)
+            norm = _normalize_rel(rel_path)
             src = _resolve_under(rel_path, source_dir)
             if src is None:
                 warnings.append(f"image path escapes source dir: {rel_path}")
@@ -93,10 +95,10 @@ def collect_images(
                 )
                 continue
 
-            dest_name = assigned.get(src)
+            dest_name = assigned.get(norm)
             if dest_name is None:
-                dest_name = _unique_name(src, taken)
-                assigned[src] = dest_name
+                dest_name = _unique_name(src.name, norm, taken)
+                assigned[norm] = dest_name
                 taken.add(dest_name)
                 images_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, images_dir / dest_name)
@@ -139,18 +141,32 @@ def _resolve_under(rel_path: str, source_dir: Path) -> Path | None:
     return candidate
 
 
-def _unique_name(src: Path, taken: set[str]) -> str:
-    """A destination filename for ``src``, disambiguated on basename clash.
+def _normalize_rel(rel_path: str) -> str:
+    """Normalize an image's relative path to a stable POSIX key.
 
-    When the bare ``src.name`` is free it is used as-is. When another source
-    already claimed that basename, the new name is prefixed with the first 8
-    hex chars of a SHA-1 of the resolved source path - stable across re-runs,
-    so the same source always lands at the same dest name.
+    Strips surrounding quotes/whitespace, collapses ``./`` and ``\\`` so the
+    same image referenced as ``./a/b.png`` and ``a\\b.png`` shares a dest name.
+    The original (un-normalized) text is preserved in :class:`ImageRef`.
     """
-    base = src.name
+    p = rel_path.strip().strip('"').strip("'")
+    # Collapse redundant separators and ``.`` segments; treat backslashes as
+    # separators so ``a\b.png`` and ``a/b.png`` share a dest name.
+    parts = [seg for seg in p.replace("\\", "/").split("/") if seg and seg != "."]
+    return "/".join(parts)
+
+
+def _unique_name(basename: str, norm_rel: str, taken: set[str]) -> str:
+    """A destination filename, disambiguated on basename clash.
+
+    When the bare ``basename`` is free it is used as-is. When another source
+    already claimed that basename, the new name is prefixed with the first 8
+    hex chars of a SHA-1 of the **normalized relative path** (not the absolute
+    resolved path) so the dest name is stable when the input directory moves.
+    """
+    base = basename
     if base not in taken:
         return base
-    digest = hashlib.sha1(str(src).encode("utf-8")).hexdigest()[:8]
+    digest = hashlib.sha1(norm_rel.encode("utf-8")).hexdigest()[:8]
     candidate = f"{digest}_{base}"
     # Extremely unlikely (two distinct sources hashing to the same 8-char
     # prefix AND sharing a basename), but guard against an infinite reuse.

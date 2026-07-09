@@ -22,7 +22,7 @@ from pathlib import Path
 
 from openkb.okf.assets import collect_images, count_missing
 from openkb.okf.bundle import write_zip
-from openkb.okf.llm import LLMClient, LLMConfig, extract
+from openkb.okf.llm import LLMClient, LLMConfig, extract, redact_secrets
 from openkb.okf.markdown import extract_title, split_sections
 from openkb.okf.render import render_bundle
 from openkb.okf.schema import Extracts, SectionSpec
@@ -63,15 +63,27 @@ class CompileResult:
     manifest: dict | None = None
     warnings: list[str] = field(default_factory=list)
 
-    def to_report(self) -> dict:
-        """Compact dict for the batch report (no api_key, ever)."""
+    def to_report(
+        self,
+        *,
+        input_root: Path | None = None,
+        output_root: Path | None = None,
+        api_key: str | None = None,
+    ) -> dict:
+        """Compact dict for the batch report.
+
+        Input/output paths are made relative to ``input_root``/``output_root``
+        when possible (so the report is portable and carries no absolute
+        local paths). ``error`` and ``warnings`` are secret-redacted so a
+        thrown exception can never leak the api_key into the report.
+        """
         return {
-            "input": _posix(self.input_path),
-            "output": _posix(self.output_path) if self.output_path else None,
+            "input": _rel_posix(self.input_path, input_root),
+            "output": _rel_posix(self.output_path, output_root) if self.output_path else None,
             "status": ("skipped" if self.skipped else ("ok" if self.ok else "failed")),
-            "error": self.error or None,
+            "error": redact_secrets(self.error, api_key) if self.error else None,
             "counts": (self.manifest or {}).get("counts"),
-            "warnings": list(self.warnings),
+            "warnings": [redact_secrets(w, api_key) for w in self.warnings],
         }
 
 
@@ -143,7 +155,12 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
                 )
                 llm_enabled = True
             except Exception as exc:  # noqa: BLE001 - a bad config/call degrades to no-llm, not a crash
-                warnings.append(f"llm: disabled for this article ({type(exc).__name__}: {exc})")
+                warnings.append(
+                    redact_secrets(
+                        f"llm: disabled for this article ({type(exc).__name__}: {exc})",
+                        opts.llm_config.api_key if opts.llm_config else None,
+                    )
+                )
                 llm_enabled = False
         # Surface missing-asset count as a warning line for visibility.
         missing = count_missing(image_refs)
@@ -156,7 +173,7 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
             sections=sections,
             image_refs=image_refs,
             extracts=extracts,
-            source_path=_posix(input_md),
+            original_filename=input_md.name,
             title=title,
             language=opts.language,
             llm_enabled=llm_enabled,
@@ -173,7 +190,14 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
         )
     except Exception as exc:  # noqa: BLE001 - never crash the batch; report the failure
         logger.debug("compile_one failed for %s", input_md, exc_info=True)
-        return CompileResult(input_md, out, ok=False, error=f"{type(exc).__name__}: {exc}")
+        # Redact secrets from the error string (a thrown API error may echo the key).
+        api_key = opts.llm_config.api_key if opts.llm_config else None
+        return CompileResult(
+            input_md,
+            out,
+            ok=False,
+            error=redact_secrets(f"{type(exc).__name__}: {exc}", api_key),
+        )
     finally:
         if not opts.keep_workdir:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -188,6 +212,12 @@ class BatchReport:
     skipped: int = 0
     failed: int = 0
     results: list[CompileResult] = field(default_factory=list)
+    # Roots for relativizing per-result input/output paths in the report, and
+    # the api_key to redact from any error/warning string. ``input_root``/
+    # ``output_root`` may be ``None`` (single-file compile -> absolute paths).
+    input_root: Path | None = None
+    output_root: Path | None = None
+    api_key: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -195,7 +225,14 @@ class BatchReport:
             "ok": self.ok,
             "skipped": self.skipped,
             "failed": self.failed,
-            "results": [r.to_report() for r in self.results],
+            "results": [
+                r.to_report(
+                    input_root=self.input_root,
+                    output_root=self.output_root,
+                    api_key=self.api_key,
+                )
+                for r in self.results
+            ],
         }
 
 
@@ -224,11 +261,31 @@ def compile_dir(
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    inputs = enumerate_inputs(input_dir, mode=mode, glob_pattern=glob_pattern, recursive=recursive)
-    report = BatchReport(total=len(inputs))
+    inputs, wechat_skips = enumerate_inputs(
+        input_dir, mode=mode, glob_pattern=glob_pattern, recursive=recursive
+    )
+    report = BatchReport(
+        total=len(inputs),
+        input_root=input_dir,
+        output_root=out_dir,
+        api_key=opts.llm_config.api_key if opts.llm_config else None,
+    )
 
     if not inputs:
         logger.warning("compile-dir: no Markdown files found under %s (mode=%s)", input_dir, mode)
+
+    # Record wechat ambiguous-dir skips up front so the report reflects them.
+    for skip_dir in wechat_skips:
+        report.results.append(
+            CompileResult(
+                skip_dir,
+                None,
+                ok=False,
+                skipped=True,
+                error="ambiguous wechat article dir: multiple .md, none matches dir name",
+            )
+        )
+        report.skipped += 1
 
     # When skip_existing is on, drop already-compiled targets up front so they
     # don't consume a worker slot (and so the report reflects the real work).
@@ -256,7 +313,17 @@ def compile_dir(
     failed_hard = False
     if max_workers <= 1:
         for item in pending:
-            r = _do(item)
+            try:
+                r = _do(item)
+            except Exception as exc:  # noqa: BLE001 - worker blew up pre-capture
+                md = item[0]
+                api_key = opts.llm_config.api_key if opts.llm_config else None
+                r = CompileResult(
+                    md,
+                    None,
+                    ok=False,
+                    error=redact_secrets(f"{type(exc).__name__}: {exc}", api_key),
+                )
             report.results.append(r)
             if r.ok:
                 report.ok += 1
@@ -275,7 +342,13 @@ def compile_dir(
                     r = fut.result()
                 except Exception as exc:  # noqa: BLE001 - worker blew up
                     md = futures[fut][0]
-                    r = CompileResult(md, None, ok=False, error=f"{type(exc).__name__}: {exc}")
+                    api_key = opts.llm_config.api_key if opts.llm_config else None
+                    r = CompileResult(
+                        md,
+                        None,
+                        ok=False,
+                        error=redact_secrets(f"{type(exc).__name__}: {exc}", api_key),
+                    )
                 report.results.append(r)
                 if r.ok:
                     report.ok += 1
@@ -341,67 +414,93 @@ def _output_name(md: Path, used: set[str], *, relative_to: Path) -> str:
 
 def enumerate_inputs(
     input_dir: Path, *, mode: str, glob_pattern: str, recursive: bool
-) -> list[Path]:
-    """Return the Markdown files to compile under ``input_dir`` per ``mode``.
+) -> tuple[list[Path], list[Path]]:
+    """Return ``(inputs, wechat_skips)`` for the files to compile under ``input_dir``.
 
-    - ``flat``: every ``.md``/``.markdown`` file (recursively when ``recursive``).
+    - ``flat``: every ``.md``/``.markdown`` file (recursively when ``recursive``);
+      no wechat skips.
     - ``wechat``: detects ``wechat_article_to_markdown`` output layout - a
       tree of article directories each containing one main ``.md`` (plus
-      assets). Only the main article Markdown is selected per directory.
+      assets). Only the main article Markdown is selected per directory;
+      ambiguous directories (multiple md, none matching the dir stem) are
+      returned in ``wechat_skips``.
     - ``auto``: try ``wechat`` first; fall back to ``flat`` when no article
-      dirs are detected.
+      dirs are detected (and so no skips either).
     """
     if not input_dir.is_dir():
-        return []
+        return [], []
     mode = (mode or "auto").lower()
     if mode == "flat":
-        return _flat_inputs(input_dir, glob_pattern, recursive)
+        return _flat_inputs(input_dir, glob_pattern, recursive), []
     if mode == "wechat":
         return _wechat_inputs(input_dir)
     if mode == "auto":
-        wechat = _wechat_inputs(input_dir)
-        if wechat:
-            return wechat
-        return _flat_inputs(input_dir, glob_pattern, recursive)
+        selected, skips = _wechat_inputs(input_dir)
+        if selected or skips:
+            return selected, skips
+        return _flat_inputs(input_dir, glob_pattern, recursive), []
     raise ValueError(f"unknown mode: {mode!r} (expected auto|flat|wechat)")
 
 
 def _flat_inputs(input_dir: Path, glob_pattern: str, recursive: bool) -> list[Path]:
-    """All Markdown files under ``input_dir`` matching ``glob_pattern``."""
-    # ``glob_pattern`` filters the basename (e.g. ``*.md``); suffix is the
-    # real gate so a ``*.markdown`` glob still picks up ``.markdown`` files.
+    """All Markdown files under ``input_dir``.
+
+    By default discovers both ``.md`` and ``.markdown`` (the spec's required
+    default). When ``glob_pattern`` is customized beyond ``*.md``/``*.markdown``
+    it is applied as the basename filter instead of the suffix gate, so a
+    user passing ``--glob "*.markdown"`` still gets only ``.markdown`` files.
+    """
+    # The default ``*.md`` glob would miss ``.markdown`` files; when it is the
+    # pattern (the CLI default) ignore the glob and gate purely on the known
+    # Markdown suffix set so both ``.md`` and ``.markdown`` are discovered. An
+    # explicit ``--glob "*.markdown"`` is honored literally (only .markdown).
+    if glob_pattern == "*.md":
+        iterator = input_dir.rglob("*") if recursive else input_dir.iterdir()
+        out = [p for p in iterator if p.is_file() and p.suffix.lower() in _MD_SUFFIXES]
+        out.sort()
+        return out
     iterator = input_dir.rglob(glob_pattern) if recursive else input_dir.glob(glob_pattern)
     out = [p for p in iterator if p.is_file() and p.suffix.lower() in _MD_SUFFIXES]
     out.sort()
     return out
 
 
-def _wechat_inputs(input_dir: Path) -> list[Path]:
+def _wechat_inputs(input_dir: Path) -> tuple[list[Path], list[Path]]:
     """Pick the main article ``.md`` in each wechat_article_to_markdown dir.
 
-    The wechat layout puts each article in its own subdirectory alongside an
-    ``assets/`` folder; the main Markdown is the (typically largest) ``.md``
-    directly in the article dir. We pick the largest ``.md`` by byte size as
-    a stable heuristic when more than one is present (sometimes a README or
-    index sneaks in). Returns ``[]`` when no article dirs are detected, so
-    ``auto`` mode can fall back to flat.
+    Selection per article directory (in priority order):
+      1. the ``.md`` whose stem matches the directory name (e.g.
+         ``my-article/my-article.md``) - the wechat convention;
+      2. if exactly one ``.md`` is present, that one;
+      3. if multiple ``.md`` files are present and none matches the dir stem,
+         the directory is *ambiguous* and skipped (returned in ``skips``)
+         rather than guessed - the user should disambiguate.
+
+    Returns ``(selected, skips)``. ``selected`` is the list of main ``.md``
+    paths to compile; ``skips`` is the list of ambiguous article dirs.
     """
-    article_dirs = []
+    selected: list[Path] = []
+    skips: list[Path] = []
     for child in sorted(input_dir.iterdir()):
         if not child.is_dir():
             continue
         # An article dir has at least one .md and (typically) an assets/ dir.
-        mds = [p for p in child.glob("*.md") if p.is_file()]
-        if mds:
-            article_dirs.append((child, mds))
-    if not article_dirs:
-        return []
-    out = []
-    for _dir, mds in article_dirs:
-        mds.sort(key=lambda p: p.stat().st_size, reverse=True)
-        out.append(mds[0])
-    out.sort()
-    return out
+        mds = sorted(p for p in child.glob("*.md") if p.is_file())
+        if not mds:
+            continue
+        # 1. prefer the md whose stem matches the directory name.
+        match = next((p for p in mds if p.stem == child.name), None)
+        if match is not None:
+            selected.append(match)
+            continue
+        # 2. exactly one md -> use it.
+        if len(mds) == 1:
+            selected.append(mds[0])
+            continue
+        # 3. ambiguous: no same-name match and more than one md. Skip the dir.
+        skips.append(child)
+    selected.sort()
+    return selected, skips
 
 
 def _resolve_workdir(opts: CompileOptions) -> Path:
@@ -420,3 +519,21 @@ def _write_report(report_path: Path, data: dict) -> None:
 
 def _posix(path: Path) -> str:
     return Path(path).as_posix()
+
+
+def _rel_posix(path: Path | None, root: Path | None) -> str:
+    """POSIX path of ``path``, made relative to ``root`` when possible.
+
+    Falls back to the absolute POSIX path when ``root`` is None or ``path``
+    is not under it - so a single-file compile (no root) still records the
+    path, while a ``compile-dir`` run records portable relative paths.
+    """
+    if path is None:
+        return ""
+    p = Path(path)
+    if root is not None:
+        try:
+            return p.resolve().relative_to(Path(root).resolve()).as_posix()
+        except ValueError:
+            pass
+    return p.as_posix()

@@ -104,7 +104,7 @@ def okf() -> None:
 @click.option(
     "--language",
     "language",
-    default="en",
+    default="zh",
     show_default=True,
     help="Language for the generated summary.",
 )
@@ -229,7 +229,7 @@ def compile_cmd(
     default=None,
     help=f"Write a JSON batch report here (default: <OUT>/{DEFAULT_REPORT_NAME}).",
 )
-@click.option("--language", "language", default="en", show_default=True)
+@click.option("--language", "language", default="zh", show_default=True)
 @click.option("--max-concepts", "max_concepts", type=int, default=12, show_default=True)
 @click.option("--max-entities", "max_entities", type=int, default=12, show_default=True)
 @_llm_options

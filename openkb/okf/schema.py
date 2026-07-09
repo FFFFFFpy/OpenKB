@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 OKF_FORMAT = "okf-bundle"
 OKF_VERSION = 1
 OKF_BUNDLE_KIND = "markdown_article"
-OKF_BUNDLE_TYPE = "single-article"  # manifest.json bundle_type
+OKF_BUNDLE_TYPE = "markdown_article"  # manifest.json bundle_type (aligned with kind)
 
 # The compiler identity recorded in manifest.json. ``mode`` marks this as a
 # fresh single-Markdown compile (no global KB state touched).
@@ -114,7 +114,44 @@ class Evidence:
     line_end: int
 
     def is_valid(self) -> bool:
+        """Structural validity only (no section-map check).
+
+        Use :func:`validate_evidence` for the full check against the article's
+        section map - that's what the extractor calls before keeping an extract.
+        """
         return bool(self.heading_path) and self.line_start >= 1 and self.line_end >= self.line_start
+
+
+def validate_evidence(
+    evidence: Evidence | None, sections: list[SectionSpec], total_lines: int
+) -> bool:
+    """Full evidence check against the article's section map.
+
+    Returns True only when:
+      * ``evidence`` is present and structurally valid;
+      * ``heading_path`` matches a known ``SectionSpec.heading_path``;
+      * ``line_start``/``line_end`` fall within that section's
+        ``[section.line_start, section.line_end]`` range;
+      * ``line_end >= line_start``.
+
+    ``total_lines`` bounds the document so an out-of-section but in-range
+    citation against a heading whose range we lost can't slip through; the
+    section-range check is the primary gate, ``total_lines`` is a backstop.
+    """
+    if evidence is None or not evidence.is_valid():
+        return False
+    for sec in sections:
+        if sec.heading_path == evidence.heading_path:
+            return (
+                sec.line_start <= evidence.line_start <= sec.line_end
+                and sec.line_start <= evidence.line_end <= sec.line_end
+                and evidence.line_end >= evidence.line_start
+            )
+    # No matching section. If there are no sections at all (whole-doc), accept
+    # any in-document range; otherwise reject.
+    if not sections:
+        return 1 <= evidence.line_start <= total_lines and evidence.line_end <= total_lines
+    return False
 
 
 @dataclass
@@ -124,6 +161,7 @@ class ConceptExtract:
     name: str
     description: str
     evidence: Evidence | None = None
+    confidence: float | None = None
 
     def is_valid(self) -> bool:
         return bool(self.name and self.name.strip()) and bool(
@@ -140,6 +178,7 @@ class EntityExtract:
     description: str
     aliases: list[str] = field(default_factory=list)
     evidence: Evidence | None = None
+    confidence: float | None = None
 
     def is_valid(self) -> bool:
         return (

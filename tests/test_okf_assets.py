@@ -8,6 +8,8 @@ basename-collision disambiguation check.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from openkb.okf.assets import collect_images, count_missing
 
 
@@ -136,3 +138,28 @@ def test_path_escape_rejected(tmp_path):
     # escaped path is dropped (not treated as found, not as missing-file)
     assert all(not r.found for r in refs)
     assert any("escapes source dir" in w for w in warnings)
+
+
+def test_collision_hash_stable_when_dir_moves(tmp_path):
+    """The dest name for a collided image must not depend on the absolute path.
+
+    Hash input is the normalized relative image path, so moving the whole
+    input directory yields the same dest name (and the same rewritten links).
+    """
+    bodies = ["![a](logo.png) ![b](sub/logo.png)\n"]
+
+    def _tree(root: Path) -> Path:
+        root.mkdir(parents=True)
+        (root / "logo.png").write_bytes(b"ROOT")
+        sub = root / "sub"
+        sub.mkdir()
+        (sub / "logo.png").write_bytes(b"NESTED")
+        return root
+
+    src1 = _tree(tmp_path / "proj" / "src")
+    src2 = _tree(tmp_path / "elsewhere" / "src")
+    _r1, refs1, _w1 = collect_images(bodies, src1, tmp_path / "b1" / "assets" / "images")
+    _r2, refs2, _w2 = collect_images(bodies, src2, tmp_path / "b2" / "assets" / "images")
+    dests1 = {r.dest_name for r in refs1 if r.found}
+    dests2 = {r.dest_name for r in refs2 if r.found}
+    assert dests1 == dests2, f"hash not stable across dir move: {dests1} vs {dests2}"
