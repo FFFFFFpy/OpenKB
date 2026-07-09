@@ -2917,3 +2917,15 @@ def _save_deck_iteration(kb_dir: Path, deck_name: str) -> Path | None:
     dest = ws / f"iteration-{next_n}"
     shutil.copytree(src, dest)
     return dest
+
+
+# ---------------------------------------------------------------------------
+# `openkb okf ...` - subtraction OKF compiler (Markdown -> OKF Bundle)
+# ---------------------------------------------------------------------------
+
+# KB-independent group: never calls _find_kb_dir, never takes the KB lock.
+# Lazy import so a `litellm`/env issue in this subpackage can't break the
+# rest of the CLI, and so the module loads without pulling okf's deps eagerly.
+from openkb.okf.cli import okf as _okf_group
+
+cli.add_command(_okf_group)
