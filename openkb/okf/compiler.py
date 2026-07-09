@@ -45,7 +45,7 @@ class CompileOptions:
     keep_workdir: bool = False
     overwrite: bool = False
     no_llm: bool = False
-    language: str = "en"
+    language: str = "zh"
     max_concepts: int = 12
     max_entities: int = 12
     llm_config: LLMConfig | None = None
@@ -62,6 +62,7 @@ class CompileResult:
     error: str = ""
     manifest: dict | None = None
     warnings: list[str] = field(default_factory=list)
+    workdir_path: Path | None = None
 
     def to_report(
         self,
@@ -77,7 +78,7 @@ class CompileResult:
         local paths). ``error`` and ``warnings`` are secret-redacted so a
         thrown exception can never leak the api_key into the report.
         """
-        return {
+        data = {
             "input": _rel_posix(self.input_path, input_root),
             "output": _rel_posix(self.output_path, output_root) if self.output_path else None,
             "status": ("skipped" if self.skipped else ("ok" if self.ok else "failed")),
@@ -85,15 +86,18 @@ class CompileResult:
             "counts": (self.manifest or {}).get("counts"),
             "warnings": [redact_secrets(w, api_key) for w in self.warnings],
         }
+        if self.workdir_path is not None:
+            data["workdir"] = self.workdir_path.as_posix()
+        return data
 
 
 def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResult:
     """Compile a single Markdown file into ``out`` (a ``.okf.zip``).
 
-    ``out`` should be the final zip path; a temp workdir is created (or the
-    caller-provided ``opts.workdir`` is used) and removed unless
-    ``opts.keep_workdir``. Overwrite handling: an existing ``out`` is an error
-    unless ``opts.overwrite``.
+    ``out`` should be the final zip path; a unique temp workdir is created
+    under the caller-provided ``opts.workdir`` base (or the system temp dir)
+    and removed unless ``opts.keep_workdir``. Overwrite handling: an existing
+    ``out`` is an error unless ``opts.overwrite``.
     """
     input_md = Path(input_md).resolve()
     out = Path(out).resolve()
@@ -101,6 +105,14 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
 
     if not input_md.exists():
         return CompileResult(input_md, out, ok=False, error=f"input not found: {input_md}")
+    if input_md.suffix.lower() not in _MD_SUFFIXES:
+        allowed = ", ".join(sorted(_MD_SUFFIXES))
+        return CompileResult(
+            input_md,
+            out,
+            ok=False,
+            error=f"input must be Markdown ({allowed}): {input_md.name}",
+        )
     if out.exists() and not opts.overwrite:
         return CompileResult(
             input_md,
@@ -110,9 +122,9 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
             error="output exists (use --overwrite)",
         )
 
-    workdir = _resolve_workdir(opts)
-    workdir.mkdir(parents=True, exist_ok=True)
+    workdir: Path | None = None
     try:
+        workdir = _create_workdir(opts)
         markdown = input_md.read_text(encoding="utf-8")
         sections = split_sections(markdown)
         if not sections:
@@ -187,6 +199,7 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
             ok=True,
             manifest=manifest,
             warnings=list(extracts.warnings) + list(warnings),
+            workdir_path=workdir if opts.keep_workdir else None,
         )
     except Exception as exc:  # noqa: BLE001 - never crash the batch; report the failure
         logger.debug("compile_one failed for %s", input_md, exc_info=True)
@@ -197,9 +210,10 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
             out,
             ok=False,
             error=redact_secrets(f"{type(exc).__name__}: {exc}", api_key),
+            workdir_path=workdir if (workdir is not None and opts.keep_workdir) else None,
         )
     finally:
-        if not opts.keep_workdir:
+        if workdir is not None and not opts.keep_workdir:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -265,7 +279,7 @@ def compile_dir(
         input_dir, mode=mode, glob_pattern=glob_pattern, recursive=recursive
     )
     report = BatchReport(
-        total=len(inputs),
+        total=len(inputs) + len(wechat_skips),
         input_root=input_dir,
         output_root=out_dir,
         api_key=opts.llm_config.api_key if opts.llm_config else None,
@@ -456,13 +470,40 @@ def _flat_inputs(input_dir: Path, glob_pattern: str, recursive: bool) -> list[Pa
     # explicit ``--glob "*.markdown"`` is honored literally (only .markdown).
     if glob_pattern == "*.md":
         iterator = input_dir.rglob("*") if recursive else input_dir.iterdir()
-        out = [p for p in iterator if p.is_file() and p.suffix.lower() in _MD_SUFFIXES]
+        out = [
+            p
+            for p in iterator
+            if p.is_file()
+            and p.suffix.lower() in _MD_SUFFIXES
+            and not _is_excluded_flat_path(p, input_dir)
+        ]
         out.sort()
         return out
     iterator = input_dir.rglob(glob_pattern) if recursive else input_dir.glob(glob_pattern)
-    out = [p for p in iterator if p.is_file() and p.suffix.lower() in _MD_SUFFIXES]
+    out = [
+        p
+        for p in iterator
+        if p.is_file()
+        and p.suffix.lower() in _MD_SUFFIXES
+        and not _is_excluded_flat_path(p, input_dir)
+    ]
     out.sort()
     return out
+
+
+_FLAT_EXCLUDED_DIRS = {".git", ".openkb", "node_modules", "__pycache__"}
+
+
+def _is_excluded_flat_path(path: Path, input_dir: Path) -> bool:
+    """True when ``path`` lives under directories flat mode should ignore."""
+    try:
+        rel = path.resolve().relative_to(input_dir.resolve())
+    except ValueError:
+        rel = path
+    for part in rel.parts[:-1]:
+        if part in _FLAT_EXCLUDED_DIRS or part.endswith(".okf"):
+            return True
+    return False
 
 
 def _wechat_inputs(input_dir: Path) -> tuple[list[Path], list[Path]]:
@@ -503,11 +544,13 @@ def _wechat_inputs(input_dir: Path) -> tuple[list[Path], list[Path]]:
     return selected, skips
 
 
-def _resolve_workdir(opts: CompileOptions) -> Path:
-    """Use the caller-provided workdir, else a fresh temp dir."""
+def _create_workdir(opts: CompileOptions) -> Path:
+    """Create a unique child staging dir under the configured base dir."""
     if opts.workdir is not None:
-        return Path(opts.workdir).resolve()
-    return Path(tempfile.mkdtemp(prefix="okf-compile-"))
+        base = Path(opts.workdir).resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="okf-compile-", dir=base))
+    return Path(tempfile.mkdtemp(prefix="okf-compile-")).resolve()
 
 
 def _write_report(report_path: Path, data: dict) -> None:

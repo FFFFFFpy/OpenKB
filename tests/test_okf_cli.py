@@ -83,6 +83,69 @@ def test_compile_overwrite_required(tmp_path):
     assert r3.exit_code == 0
 
 
+def test_workdir_option_is_base_and_child_is_cleaned(tmp_path):
+    """--workdir is a staging base; compile must not remove the user base dir."""
+    md = _write_md(tmp_path)
+    out = tmp_path / "out.okf.zip"
+    base = tmp_path / "staging-base"
+    base.mkdir()
+    (base / "sentinel.txt").write_text("keep me", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["okf", "compile", str(md), "--no-llm", "--out", str(out), "--workdir", str(base)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert base.exists()
+    assert (base / "sentinel.txt").read_text(encoding="utf-8") == "keep me"
+    assert not list(base.glob("okf-compile-*"))
+
+
+def test_keep_workdir_preserves_child_and_prints_path(tmp_path):
+    """--keep-workdir keeps the unique child, not just the base."""
+    md = _write_md(tmp_path)
+    out = tmp_path / "out.okf.zip"
+    base = tmp_path / "staging-base"
+    base.mkdir()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "okf",
+            "compile",
+            str(md),
+            "--no-llm",
+            "--out",
+            str(out),
+            "--workdir",
+            str(base),
+            "--keep-workdir",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    children = list(base.glob("okf-compile-*"))
+    assert len(children) == 1
+    assert (children[0] / "manifest.json").exists()
+    assert str(children[0]) in result.output
+
+
+def test_compile_rejects_non_markdown_file(tmp_path):
+    txt = tmp_path / "not-markdown.txt"
+    txt.write_text("plain text", encoding="utf-8")
+    out = tmp_path / "out.okf.zip"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["okf", "compile", str(txt), "--no-llm", "--out", str(out)])
+
+    assert result.exit_code != 0
+    assert "markdown" in result.output.lower()
+    assert not out.exists()
+
+
 def test_okf_group_registered():
     """The okf group must be wired into the main cli (regression for add_command)."""
     runner = CliRunner()

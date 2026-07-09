@@ -261,10 +261,10 @@ def test_summary_and_concept_frontmatter(tmp_path):
     )
     summary = (workdir / "extracts" / "summary.md").read_text(encoding="utf-8")
     assert 'type: "Document Summary"' in summary
-    assert 'source: "../sources/article.md"' in summary
+    assert 'source: "sources/article.md"' in summary
     concept = (workdir / "extracts" / "concepts" / "concepta.md").read_text(encoding="utf-8")
     assert 'type: "Local Concept"' in concept
-    assert 'source: "../../sources/article.md"' in concept
+    assert 'source: "sources/article.md"' in concept
     assert "confidence: 0.9" in concept
 
 

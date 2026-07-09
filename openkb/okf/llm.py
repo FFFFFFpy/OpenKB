@@ -338,7 +338,14 @@ def extract(
             entities=out.entities,
         )
         raw = client.json_completion(sys_msg, user_msg)
-        out.relations = _parse_relations(raw, warnings, sections, total_lines)
+        out.relations = _parse_relations(
+            raw,
+            warnings,
+            sections,
+            total_lines,
+            concepts=out.concepts,
+            entities=out.entities,
+        )
     except Exception as exc:  # noqa: BLE001
         _record_warning(f"relations: extraction failed ({_err(exc)})")
 
@@ -365,9 +372,46 @@ def _parse_entities(raw, warnings, sections, total_lines):
     return _filter_with_evidence(items, "entity", warnings, _to_entity, sections, total_lines)
 
 
-def _parse_relations(raw, warnings, sections, total_lines):
+def _parse_relations(
+    raw,
+    warnings,
+    sections,
+    total_lines,
+    *,
+    concepts=None,
+    entities=None,
+    allowed_names=None,
+):
     items = _extract_items(raw, "relations")
-    return _filter_with_evidence(items, "relation", warnings, _to_edge, sections, total_lines)
+    if allowed_names is None and (concepts is not None or entities is not None):
+        allowed_names = [c.name for c in concepts or []] + [e.name for e in entities or []]
+    if allowed_names is None:
+        return _filter_with_evidence(items, "relation", warnings, _to_edge, sections, total_lines)
+
+    allowed = {name.strip() for name in allowed_names if isinstance(name, str) and name.strip()}
+    kept = []
+    evidence_dropped = 0
+    node_dropped = 0
+    for it in items:
+        ext = _to_edge(it)
+        if ext is None or not validate_evidence(ext.evidence, sections, total_lines):
+            evidence_dropped += 1
+            continue
+        if ext.subject not in allowed or ext.object not in allowed:
+            node_dropped += 1
+            continue
+        kept.append(ext)
+    if evidence_dropped:
+        warnings.append(
+            "relation: dropped "
+            f"{evidence_dropped} item(s) with missing/invalid/out-of-range evidence"
+        )
+    if node_dropped:
+        warnings.append(
+            "relation: dropped "
+            f"{node_dropped} item(s) with subject/object outside prior concepts/entities"
+        )
+    return kept
 
 
 def _extract_items(raw: str, key: str) -> list[dict]:

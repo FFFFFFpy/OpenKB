@@ -326,6 +326,25 @@ def test_relations_prompt_receives_prior_concepts_and_entities():
     assert "MUST be exact names from the prior" in relations_call
 
 
+def test_relation_with_unknown_subject_or_object_is_dropped():
+    sections = split_sections(_MD)
+    responses = [
+        '{"summary": "s"}',
+        '{"concepts": [{"name": "Attention", "description": "d", "evidence": '
+        '{"heading_path": "Intro", "line_start": 3, "line_end": 5}}]}',
+        '{"entities": []}',
+        '{"relations": [{"subject": "Unknown", "relation": "mentions", '
+        '"object": "Attention", "evidence": '
+        '{"heading_path": "Intro", "line_start": 3, "line_end": 5}}]}',
+    ]
+    client = LLMClient(LLMConfig(base_url="https://x/v1", model="m", api_key="sk-x"))
+
+    out = _extract_with_json(client, _MD, sections, responses=responses)
+
+    assert out.relations == []
+    assert any("subject/object" in w for w in out.warnings)
+
+
 def test_api_key_redacted_from_exception_warning():
     """A thrown exception whose message echoes the api_key is redacted in warnings."""
     sections = split_sections(_MD)

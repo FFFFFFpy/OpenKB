@@ -354,6 +354,8 @@ def _print_result(result) -> None:
         click.echo(f"[FAIL] {result.input_path.name}: {result.error}", err=True)
         return
     click.echo(f"[OK] {result.input_path.name} -> {result.output_path}")
+    if result.workdir_path is not None:
+        click.echo(f"     workdir={result.workdir_path}")
     if result.manifest:
         counts = result.manifest.get("counts", {})
         click.echo(

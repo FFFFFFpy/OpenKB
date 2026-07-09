@@ -183,11 +183,10 @@ def _write_summary(workdir: Path, extracts: Extracts, title: str) -> None:
     no line evidence is attached.
     """
     body = extracts.summary.strip() if extracts.summary else "_(no summary available)_"
-    # extracts/summary.md is one level deep, so the source link climbs one dir.
     lines = [
         frontmatter.kv_line("type", "Document Summary"),
         frontmatter.kv_line("title", title),
-        frontmatter.kv_line("source", "../" + ARTICLE_MD),
+        frontmatter.kv_line("source", ARTICLE_MD),
     ]
     atomic_write_text(workdir / SUMMARY_MD, frontmatter.block(lines) + f"{body}\n")
 
@@ -195,14 +194,12 @@ def _write_summary(workdir: Path, extracts: Extracts, title: str) -> None:
 def _write_concepts(
     workdir: Path, concepts: list[ConceptExtract], sections: list[SectionSpec]
 ) -> None:
-    # extracts/concepts/*.md is two levels deep, so the source link climbs two dirs.
-    concept_source = "../../" + ARTICLE_MD
     for c in concepts:
         slug = _slugify(c.name) or "concept"
         lines = [
             frontmatter.kv_line("type", "Local Concept"),
             frontmatter.kv_line("title", c.name),
-            frontmatter.kv_line("source", concept_source),
+            frontmatter.kv_line("source", ARTICLE_MD),
             frontmatter.kv_line("scope", "local"),
             frontmatter.kv_line("heading_path", c.evidence.heading_path if c.evidence else ""),
             f"line_start: {c.evidence.line_start if c.evidence else 0}",
@@ -218,14 +215,12 @@ def _write_concepts(
 def _write_entities(
     workdir: Path, entities: list[EntityExtract], sections: list[SectionSpec]
 ) -> None:
-    # extracts/entities/*.md is two levels deep, so the source link climbs two dirs.
-    entity_source = "../../" + ARTICLE_MD
     for e in entities:
         slug = _slugify(e.name) or "entity"
         lines = [
             frontmatter.kv_line("type", f"Local {_capitalize(e.entity_type)}"),
             frontmatter.kv_line("title", e.name),
-            frontmatter.kv_line("source", entity_source),
+            frontmatter.kv_line("source", ARTICLE_MD),
             frontmatter.kv_line("scope", "local"),
             frontmatter.list_line("aliases", e.aliases)
             if e.aliases

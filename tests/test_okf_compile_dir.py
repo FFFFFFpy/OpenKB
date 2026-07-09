@@ -242,6 +242,28 @@ def test_wechat_ambiguous_dir_skipped_not_guessed(tmp_path):
     data = json.loads(report.read_text(encoding="utf-8"))
     skip = [r for r in data["results"] if r["status"] == "skipped"]
     assert any(r["input"].endswith("ambiguous") for r in skip), skip
+    assert data["total"] == 2
+    assert data["ok"] + data["skipped"] + data["failed"] == data["total"]
+
+
+def test_flat_mode_excludes_obvious_non_source_dirs(tmp_path):
+    indir = tmp_path / "in"
+    indir.mkdir()
+    _make_md(indir / "keep.md", "Keep")
+    for dirname in (".git", ".openkb", "node_modules", "__pycache__", "debug.okf"):
+        d = indir / dirname
+        d.mkdir()
+        _make_md(d / "ignored.md", f"Ignored {dirname}")
+
+    outdir = tmp_path / "out"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["okf", "compile-dir", str(indir), "--out", str(outdir), "--no-llm", "--mode", "flat"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (outdir / "keep.okf.zip").exists()
+    assert len(list(outdir.glob("*.okf.zip"))) == 1
 
 
 def test_batch_report_no_absolute_paths(tmp_path):
